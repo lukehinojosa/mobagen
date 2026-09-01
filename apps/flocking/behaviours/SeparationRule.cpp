@@ -11,7 +11,16 @@ glm::vec2 SeparationRule::computeForce(const std::vector<BoidView>& neighborhood
   // multiply by (desiredMinimalDistance / distance) is the proportionality factor that makes the force stronger when the boids are closer together, and weaker when they are farther apart.
 
   // begin solution
+  for (int i = 0; i < neighborhood.size(); i++) {
+    glm::vec2 distToNeighbor = boid.position - neighborhood[i].position;
+    float distance = glm::length(distToNeighbor);
 
+    if (distance > 0.0F && distance < desiredMinimalDistance) {
+      glm::vec2 repelDirection = glm::normalize(distToNeighbor);
+
+      separatingForce += repelDirection * (desiredMinimalDistance / distance);
+    }
+  }
 
   // end solution
 
