@@ -3,6 +3,8 @@
 
 #include <glm/glm.hpp>
 #include "math/ColorT.h"
+#include "../behaviours/FlockingRule.h"
+#include <cstdint>
 #include <vector>
 
 struct BoidPos {
@@ -34,6 +36,22 @@ struct BoidDebug {
 
 struct BoidForceCache {
   std::vector<glm::vec2> forces;
+};
+
+// Persistent per-boid V-formation state. Stamina (leaders drain it, drafters recover
+// it) plus the boid's communicated role in the formation: which arm it belongs to, how
+// deep along that arm it sits, which formation (the leader's entity index), and the slot
+// it is currently steering toward.
+struct BoidFormation {
+  float energy = 1.f;
+  bool steppingDown = false;
+  FormationRole role = FormationRole::None;
+  int depth = 0;
+  std::uint32_t formationId = kNoFormation;
+  glm::vec2 formationForward{0.f};
+  glm::vec2 target{0.f};
+  glm::vec2 targetVel{0.f};
+  bool hasTarget = false;
 };
 
 #endif
