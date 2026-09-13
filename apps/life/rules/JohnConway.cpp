@@ -114,12 +114,27 @@ void JohnConway::Step(World& world) {
   // Manager::step or the life-tests runner) calls world.SwapBuffers() right
   // AFTER this function returns. Never call SwapBuffers from inside a rule.
   // begin solution
-  for (int y = 0; y < world.Height(); ++y) {
-    for (int x = 0; x < world.Width(); ++x) {
-      AgentContext context{world, {x, y}, world.Get({x, y}), CountNeighbors(world, {x, y})};
-      machine.SetCurrent(context.isAlive ? alive : dead);
-      machine.Update(context);
+  // sparse sweep: only live cells and their neighbors can change this step, so
+  // tally alive neighbors from the live set instead of scanning the whole grid.
+  neighborCounts.clear();
+  const auto& live = world.LiveCells();
+  neighborCounts.reserve(live.size() * 9);
+  for (const auto& cell : live) {
+    // the live cell is itself a candidate, even with 0 live neighbors
+    neighborCounts.emplace(cell, 0);
+    for (int dx = -1; dx <= 1; ++dx) {
+      for (int dy = -1; dy <= 1; ++dy) {
+        if (dx == 0 && dy == 0) continue;
+        ++neighborCounts[world.Wrap({cell.x + dx, cell.y + dy})];
+      }
     }
+  }
+  // run the FSM only on the candidate cells
+  for (const auto& entry : neighborCounts) {
+    const Point2D& pos = entry.first;
+    AgentContext context{world, pos, world.Get(pos), entry.second};
+    machine.SetCurrent(context.isAlive ? alive : dead);
+    machine.Update(context);
   }
   // end solution
 }

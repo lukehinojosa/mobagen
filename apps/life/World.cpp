@@ -1,54 +1,58 @@
 #include "World.h"
 #include "Random.h"
+Point2D World::Wrap(Point2D point) const {
+  // toroidal wrap into [0,width) x [0,height)
+  point.x %= width;
+  if (point.x < 0) point.x += width;
+  point.y %= height;
+  if (point.y < 0) point.y += height;
+  return point;
+}
 void World::Resize(int size) { Resize(size, size); }
 void World::Resize(int columns, int lines) {
-  currentBufferId = 0;
   width = columns;
   height = lines;
-  buffer[0].clear();
-  buffer[0].resize(columns * lines);
-  buffer[1].clear();
-  buffer[1].resize(columns * lines);
+  buffer.assign(columns * lines, false);
+  liveCells.clear();
+  nextLiveCells.clear();
+  pending.clear();
 }
 void World::SwapBuffers() {
-  currentBufferId = (currentBufferId + 1) % 2;
-  for (int i = 0; i < buffer[currentBufferId].size(); i++) buffer[(currentBufferId + 1) % 2][i] = buffer[currentBufferId][i];
+  // apply the staged next-generation writes to the dense mirror
+  for (const auto& [point, value] : pending) buffer[point.y * width + point.x] = value;
+  // next generation becomes current, ready the staging for the following step
+  std::swap(liveCells, nextLiveCells);
+  pending.clear();
+  nextLiveCells.clear();
 }
-// todo: improve those set / get accessors
 void World::SetNext(Point2D point, bool value) {
-  if (point.x < 0) point.x += width;
-  if (point.x >= width) point.x %= width;
-  if (point.y < 0) point.y += height;
-  if (point.y >= height) point.y %= height;
-  auto index = point.y * width + point.x;
-  auto size = width * height;
-  if (index >= size) index %= size;
-  buffer[(currentBufferId + 1) % 2][index] = value;
+  point = Wrap(point);
+  pending.emplace_back(point, value);
+  if (value)
+    nextLiveCells.insert(point);
+  else
+    nextLiveCells.erase(point);
 }
-// todo: improve those set / get accessors
 void World::SetCurrent(Point2D point, bool value) {
-  if (point.x < 0) point.x += width;
-  if (point.x >= width) point.x %= width;
-  if (point.y < 0) point.y += height;
-  if (point.y >= height) point.y %= height;
-  auto index = point.y * width + point.x;
-  auto size = width * height;
-  if (index >= size) index %= size;
-  buffer[currentBufferId % 2][index] = value;
+  point = Wrap(point);
+  buffer[point.y * width + point.x] = value;
+  if (value)
+    liveCells.insert(point);
+  else
+    liveCells.erase(point);
 }
-// todo: improve those set / get accessors
 bool World::Get(Point2D point) {
-  if (point.x < 0) point.x += width;
-  if (point.x >= width) point.x %= width;
-  if (point.y < 0) point.y += height;
-  if (point.y >= height) point.y %= height;
-  auto index = point.y * width + point.x;
-  auto size = width * height;
-  if (index >= size) index %= size;
-  return buffer[currentBufferId % 2][index];
+  point = Wrap(point);
+  return buffer[point.y * width + point.x];
 }
 void World::Randomize() {
-  for (auto&& elem : buffer[0]) elem = (Random::Range(0, 1) != 0);
-
-  for (int i = 0; i < buffer[0].size(); i++) buffer[1][i] = buffer[0][i];
+  liveCells.clear();
+  nextLiveCells.clear();
+  pending.clear();
+  for (int y = 0; y < height; ++y)
+    for (int x = 0; x < width; ++x) {
+      bool alive = (Random::Range(0, 1) != 0);
+      buffer[y * width + x] = alive;
+      if (alive) liveCells.insert({x, y});
+    }
 }
