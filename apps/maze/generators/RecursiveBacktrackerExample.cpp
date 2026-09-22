@@ -53,9 +53,40 @@ bool RecursiveBacktrackerExample::Step(World* w) {
   if (stack.empty()) // Maze is done.
     return false;
 
-  visited[stack[0].x][stack[0].y] = true; // Mark top of stack as visited.
+  visited[stack[stack.size() - 1].x][stack[stack.size() - 1].y] = true; // Mark top of stack as visited.
+
+  std::vector<Point2D> visitable = getVisitables(w, stack.back()); // List top of stack's visitable neighbors.
+
+  if (visitable.empty()) // No neighbors that weren't visited.
+  {
+    stack.pop_back();
+    return true;
+  }
+
+  if (visitable.size() == 1) // Only 1 not visited, so don't consume a random number.
+    stack.push_back(visitable[0]);
+  else // Put the random unvisited neighbor at the top of the stack.
+    stack.push_back(visitable[SeededRandom::next() % visitable.size()]);
+
+  // Move
+  Point2D direction = stack[stack.size() - 1] - stack[stack.size() - 2];
+  Point2D up = {0, -1};
+  Point2D down = {0, 1};
+  Point2D left = {-1, 0};
+  Point2D right = {1, 0};
+
+  if (direction == up)
+    w->SetNorth(stack[stack.size() - 2], false);
+  else if (direction == down)
+    w->SetSouth(stack[stack.size() - 2], false);
+  else if (direction == left)
+    w->SetWest(stack[stack.size() - 2], false);
+  else if (direction == right)
+    w->SetEast(stack[stack.size() - 2], false);
+
+  // Stack is not empty after the move.
+  return true;
   // end solution
-  return false;
 }
 
 std::vector<Point2D> RecursiveBacktrackerExample::getVisitables(World* w, const Point2D& point) {
@@ -66,14 +97,14 @@ std::vector<Point2D> RecursiveBacktrackerExample::getVisitables(World* w, const 
   //   (0 <= x < w->GetWidth(), 0 <= y < w->GetHeight()) and not visited
   // begin solution
   std::vector<Point2D> notVisited;
-  if (w->GetNode(point).GetNorth())
-    notVisited.push_back({point.x, point.y - 1});
-  if (w->GetNode(point).GetEast())
-    notVisited.push_back({point.x + 1, point.y});
-  if (w->GetNode(point).GetSouth())
-    notVisited.push_back({point.x, point.y + 1});
-  if (w->GetNode(point).GetWest())
-    notVisited.push_back({point.x - 1, point.y});
+  Point2D candidates[] = {{point.x, point.y - 1},{point.x + 1, point.y},{point.x, point.y + 1},{point.x - 1, point.y}};
+  for (const Point2D& neighbor : candidates) {
+    if (neighbor.x < 0 || neighbor.x >= w->GetWidth() || neighbor.y < 0 || neighbor.y >= w->GetHeight())
+      continue;
+    if (visited[neighbor.x][neighbor.y])
+      continue;
+    notVisited.push_back(neighbor);
+  }
+  return notVisited;
   // end solution
-  return {};
 }
