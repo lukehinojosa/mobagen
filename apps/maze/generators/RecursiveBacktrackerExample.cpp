@@ -25,7 +25,9 @@ void RecursiveBacktrackerExample::Clear(World* world) {
   //   clear visited and the path stack, then start the walk at the
   //   top-left cell: stack.push_back({0, 0})
   // begin solution
-
+  visited.clear();
+  stack.clear();
+  stack.push_back({0, 0});
   // end solution
 }
 
@@ -48,7 +50,10 @@ bool RecursiveBacktrackerExample::Step(World* w) {
   //     LEFT  -> w->SetWest(current, false)
   //   return true while there is still work (stack not empty after the move)
   // begin solution
+  if (stack.empty()) // Maze is done.
+    return false;
 
+  visited[stack[0].x][stack[0].y] = true; // Mark top of stack as visited.
   // end solution
   return false;
 }
@@ -60,7 +65,15 @@ std::vector<Point2D> RecursiveBacktrackerExample::getVisitables(World* w, const 
   //   keep a candidate only if it is inside the grid
   //   (0 <= x < w->GetWidth(), 0 <= y < w->GetHeight()) and not visited
   // begin solution
-
+  std::vector<Point2D> notVisited;
+  if (w->GetNode(point).GetNorth())
+    notVisited.push_back({point.x, point.y - 1});
+  if (w->GetNode(point).GetEast())
+    notVisited.push_back({point.x + 1, point.y});
+  if (w->GetNode(point).GetSouth())
+    notVisited.push_back({point.x, point.y + 1});
+  if (w->GetNode(point).GetWest())
+    notVisited.push_back({point.x - 1, point.y});
   // end solution
   return {};
 }
