@@ -12,7 +12,7 @@ static bool sameColor(const Color32& a, const Color32& b) { return a.GetPacked()
 static bool inBounds(World* w, const Point2D& p) { return p.x >= 0 && p.x < w->GetWidth() && p.y >= 0 && p.y < w->GetHeight(); }
 
 bool PrimExample::Step(World* w) {
-  if (!initialized) // First step: pick a random start cell and add its neighbors to the frontier.
+  if (!initialized) // First step: pick a start cell and add its neighbors to the frontier.
   {
     Point2D start = {0, 0};
     w->SetNodeColor(start, visitedColor);
