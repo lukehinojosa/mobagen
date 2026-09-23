@@ -8,6 +8,9 @@
 // Dark gray background color for unvisited cells (169, 169, 169)
 static const Color32 kDarkGray = {169.0f / 255.0f, 169.0f / 255.0f, 169.0f / 255.0f, 1.0f};
 
+// Upper bound on generator steps per frame, so a Turn Duration of 0 can't stall a frame.
+static const int kMaxStepsPerFrame = 10000;
+
 World::World(int size) : width(size), height(size) {
   generators.push_back(new PrimExample());
   generators.push_back(new RecursiveBacktrackerExample());
@@ -87,7 +90,7 @@ void World::OnGui() {
   }
   ImGui::Text("Move duration: %lli", moveDuration);
   ImGui::Text("Total duration: %lli", totalTime);
-  ImGui::SliderFloat("Turn Duration", &timeBetweenAITicks, 0.00, 30);
+  ImGui::SliderFloat("Turn Duration", &timeBetweenAITicks, 0.00, 5, "%.4f", ImGuiSliderFlags_Logarithmic);
   ImGui::Text("Next turn in %.1f", timeForNextTick);
 
   ImGui::Text("Generator: %s", generators[generatorId]->GetName().c_str());
@@ -145,14 +148,19 @@ void World::OnDraw() {
 }
 
 void World::Update(float deltaTime) {
-  if (isSimulating) {
-    // update timer
-    timeForNextTick -= deltaTime;
-    if (timeForNextTick < 0) {
-      step();
-      timeForNextTick = timeBetweenAITicks;
-    }
+  if (!isSimulating) return;
+
+  // Fixed-timestep accumulator: run as many steps as the elapsed time allows,
+  // so the step rate follows Turn Duration instead of the frame rate.
+  timeForNextTick -= deltaTime;
+  int stepsThisFrame = 0;
+  while (isSimulating && timeForNextTick < 0 && stepsThisFrame < kMaxStepsPerFrame) {
+    step();  // sets isSimulating = false when the generator is done
+    timeForNextTick += timeBetweenAITicks;  // carry leftover time over, don't reset
+    stepsThisFrame++;
   }
+  if (timeForNextTick < 0)
+    timeForNextTick = 0;  // hit the cap: drop the backlog
 }
 
 void World::Clear() {
