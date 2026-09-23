@@ -19,6 +19,10 @@
 //   6. moving opens the wall between the two cells
 //      (World::SetNorth/SetEast/SetSouth/SetWest with false).
 
+// Cells on the current path are red, cells that have been backtracked out of are black.
+static const Color32 pathColor = Color::Red;
+static const Color32 visitedColor = Color::Black;
+
 void RecursiveBacktrackerExample::Clear(World* world) {
   // todo: reset the walk
   // hint:
@@ -54,11 +58,13 @@ bool RecursiveBacktrackerExample::Step(World* w) {
     return false;
 
   visited[stack[stack.size() - 1].x][stack[stack.size() - 1].y] = true; // Mark top of stack as visited.
+  w->SetNodeColor(stack.back(), pathColor); // On the current path.
 
   std::vector<Point2D> visitable = getVisitables(w, stack.back()); // List top of stack's visitable neighbors.
 
   if (visitable.empty()) // No neighbors that weren't visited.
   {
+    w->SetNodeColor(stack.back(), visitedColor); // Backtracked, so it's finished.
     stack.pop_back();
     return true;
   }
