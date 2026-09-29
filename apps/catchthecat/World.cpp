@@ -95,6 +95,7 @@ void CatWorld::step() {
 
   if (catTurn_) {
     auto move = cat_.Move(this);
+    lastMove = move;
     if (catCanMoveToPosition(move)) {
       catPosition_ = move;
       catWon_ = catWinVerification();
@@ -104,6 +105,7 @@ void CatWorld::step() {
     }
   } else {
     auto move = catcher_.Move(this);
+    lastMove = move;
     if (catcherCanMoveToPosition(move)) {
       worldState_[(move.y + sideSize_ / 2) * sideSize_ + move.x + sideSize_ / 2] = true;
       catcherWon_ = catcherWinVerification();
