@@ -15,7 +15,9 @@
 //  2. Try every block that can change that score: the cat's neighbors and the cells their scores are
 //     built from. Every other cell leaves the score as it is.
 //  3. Look ahead on the 5 best blocks: assume the cat's best reply, then the catcher's best follow-up,
-//     and keep the block whose worst case is best.
+//     looking one more cat reply and follow-up deeper for the 2 best follow-ups, and keep the block
+//     whose worst case is best. Blocks with the same worst case are split by how they do against a cat
+//     that follows its shortest path (the generatePath cat).
 //  4. Once the cat can no longer reach the border, stop defending and shrink its region: block the cell
 //     that leaves the cat the least room.
 // Blocking next to the cat (instead of walling the edge) caught last year's cats about 3 times faster.
@@ -28,6 +30,8 @@ namespace {
   constexpr int kInf = INT_MAX;
   constexpr int kSearchBlocks = 5;     // best first blocks looked ahead on
   constexpr int kFollowUpBlocks = 16;  // follow-up blocks tried after each cat reply
+  constexpr int kSearchDepth = 2;      // catcher moves looked ahead after the first block
+  constexpr int kDeepFollowUps = 2;    // follow-up blocks given the deeper look at each level
 
   // the two-distance part of the score: best two-distance among the cat's open neighbors, how many share
   // it, and how many neighbors are open
@@ -327,6 +331,115 @@ namespace {
     }
     return best;
   }
+
+  // every follow-up block's value (the same blocks bestFollowUp tries), best first
+  std::vector<std::pair<int64_t, int>> followUpValues(Buffers& b, int cat, int limit, int64_t& nodeValue) {
+    twoDistance(b, b.nodeScore);
+    bfsDistance(b, b.nodeDist);
+    std::fill(b.cand.begin(), b.cand.end(), 0);
+    b.list.clear();
+    for (int n : b.neigh[cat]) {
+      if (n >= 0 && b.open[n]) {
+        b.cand[n] = 1;
+        b.list.push_back(n);
+      }
+    }
+    for (size_t head = 0; head < b.list.size() && static_cast<int>(b.list.size()) < limit; head++) {
+      int c = b.list[head];
+      for (int m : b.neigh[c]) {
+        if (m < 0 || !b.open[m] || b.cand[m] || m == cat) {
+          continue;
+        }
+        if (b.nodeScore[m] < b.nodeScore[c] || b.nodeDist[m] < b.nodeDist[c]) {
+          b.cand[m] = 1;
+          b.list.push_back(m);
+        }
+      }
+    }
+    const Escape nodeEscape = escapeOf(b, cat, b.nodeScore);
+    const int nodeBestDist = bestDistOf(b, cat, b.nodeDist);
+    nodeValue = valueOf(nodeEscape, nodeBestDist);
+    std::vector<int> list = b.list;
+    if (static_cast<int>(list.size()) > limit) {
+      list.resize(limit);
+    }
+    markSupport(b, cat, b.nodeScore, b.inScore);
+    markSupport(b, cat, b.nodeDist, b.inDist);
+    std::vector<std::pair<int64_t, int>> values;
+    for (int y : list) {
+      b.open[y] = 0;
+      Escape e = nodeEscape;
+      if (b.inScore[y]) {
+        twoDistance(b, b.trialScore);
+        e = escapeOf(b, cat, b.trialScore);
+      }
+      int bestDist = nodeBestDist;
+      if (b.inDist[y] && e.open > 0) {
+        bfsDistance(b, b.trialDist);
+        bestDist = bestDistOf(b, cat, b.trialDist);
+      }
+      b.open[y] = 1;
+      values.push_back({valueOf(e, bestDist), y});
+    }
+    std::stable_sort(values.begin(), values.end(), [](const auto& a, const auto& c) { return a.first > c.first; });
+    return values;
+  }
+
+  // the cat's replies from `cat` (after the block just made), most dangerous first; false if it can
+  // step onto the border
+  bool catReplies(Buffers& b, int cat, std::array<std::pair<int, int>, 6>& replies, int& count) {
+    twoDistance(b, b.trialScore);
+    count = 0;
+    bool escapes = false;
+    for (int m : b.neigh[cat]) {
+      if (m < 0 || !b.open[m]) {
+        continue;
+      }
+      if (b.isBorder[m]) {
+        escapes = true;
+      }
+      replies[count++] = {b.trialScore[m], m};
+    }
+    std::stable_sort(replies.begin(), replies.begin() + count, [](const auto& a, const auto& c) { return a.first < c.first; });
+    return !escapes;
+  }
+
+  // the catcher to move, cat on `cat`. depth 1 = the best follow-up block by its immediate value; deeper =
+  // the best of the kDeepFollowUps best follow-ups, each judged by the cat's best reply and the next level.
+  // Stops once it reaches `cap` (the caller only needs to know it isn't below it).
+  int64_t catcherValue(Buffers& b, int cat, int depth, int64_t cap) {
+    if (depth <= 1) {
+      return bestFollowUp(b, cat, kFollowUpBlocks, cap);
+    }
+    int64_t nodeValue = 0;
+    auto values = followUpValues(b, cat, kFollowUpBlocks, nodeValue);
+    if (values.empty()) {
+      return nodeValue;
+    }
+    if (values[0].first == INT64_MAX) {
+      return INT64_MAX;  // a follow-up traps the cat
+    }
+    int64_t best = INT64_MIN;
+    for (int k = 0; k < static_cast<int>(values.size()) && k < kDeepFollowUps; k++) {
+      int y = values[k].second;
+      b.open[y] = 0;
+      std::array<std::pair<int, int>, 6> replies;
+      int count = 0;
+      int64_t worst = INT64_MIN;
+      if (catReplies(b, cat, replies, count)) {
+        worst = INT64_MAX;
+        for (int r = 0; r < count && worst > best; r++) {
+          worst = std::min(worst, catcherValue(b, replies[r].second, depth - 1, worst));
+        }
+      }
+      b.open[y] = 1;
+      best = std::max(best, worst);
+      if (best >= cap) {
+        return best;
+      }
+    }
+    return best;
+  }
 }  // namespace
 
 Point2D Catcher::Move(CatWorld* world) {
@@ -422,37 +535,59 @@ Point2D Catcher::Move(CatWorld* world) {
     std::stable_sort(b.rootValues.begin(), b.rootValues.end(), [](const auto& a, const auto& c) { return a.first > c.first; });
     const auto roots = b.rootValues;
     int64_t bestWorst = INT64_MIN;
-    for (int k = 0; k < static_cast<int>(roots.size()) && k < kSearchBlocks; k++) {
+    std::array<int64_t, 16> worstOf;
+    const int rootCount = std::min<int>(static_cast<int>(roots.size()), kSearchBlocks);
+    for (int k = 0; k < rootCount; k++) {
       int x = roots[k].second;
       b.open[x] = 0;
-      // the cat's replies, most dangerous (lowest two-distance) first, so hopeless blocks are dropped sooner
-      twoDistance(b, b.trialScore);
       std::array<std::pair<int, int>, 6> replies;
       int replyCount = 0;
-      bool escapes = false;
-      for (int m : b.neigh[cat]) {
-        if (m < 0 || !b.open[m]) {
-          continue;
-        }
-        if (b.isBorder[m]) {
-          escapes = true;
-        }
-        replies[replyCount++] = {b.trialScore[m], m};
-      }
-      std::stable_sort(replies.begin(), replies.begin() + replyCount, [](const auto& a, const auto& c) { return a.first < c.first; });
-      int64_t worst = INT64_MAX;
-      if (escapes) {
-        worst = INT64_MIN;  // the cat escapes
-      } else {
-        // stop once this block can no longer beat the best one found so far
-        for (int r = 0; r < replyCount && worst > bestWorst; r++) {
-          worst = std::min(worst, bestFollowUp(b, replies[r].second, kFollowUpBlocks, worst));
+      int64_t worst = INT64_MIN;  // the cat escapes unless catReplies says otherwise
+      if (catReplies(b, cat, replies, replyCount)) {
+        worst = INT64_MAX;
+        // stop once this block can no longer match the best one found so far (a tie still counts: the
+        // tie-break below needs its exact worst case)
+        for (int r = 0; r < replyCount && worst >= bestWorst; r++) {
+          worst = std::min(worst, catcherValue(b, replies[r].second, kSearchDepth, worst == bestWorst ? INT64_MAX : worst));
         }
       }
       b.open[x] = 1;
+      worstOf[k] = worst;
       if (worst > bestWorst) {
         bestWorst = worst;
         best = x;
+      }
+    }
+
+    // cat model tie-break: among blocks with the same worst case, the one that does best against a cat
+    // that follows its shortest path (the generatePath cat)
+    if (bestWorst != INT64_MIN) {
+      int ties = 0;
+      for (int k = 0; k < rootCount; k++) {
+        ties += worstOf[k] == bestWorst;
+      }
+      if (ties > 1) {
+        int64_t bestModel = INT64_MIN;
+        for (int k = 0; k < rootCount; k++) {
+          if (worstOf[k] != bestWorst) {
+            continue;
+          }
+          int x = roots[k].second;
+          b.open[x] = 0;
+          bfsDistance(b, b.trialDist);
+          int step = -1;
+          for (int m : b.neigh[cat]) {
+            if (m >= 0 && b.open[m] && (step < 0 || b.trialDist[m] < b.trialDist[step])) {
+              step = m;
+            }
+          }
+          int64_t modelValue = step < 0 ? INT64_MAX : catcherValue(b, step, 1, INT64_MAX);
+          b.open[x] = 1;
+          if (modelValue > bestModel) {
+            bestModel = modelValue;
+            best = x;
+          }
+        }
       }
     }
   }
