@@ -5,6 +5,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <vector>
 
 // Catcher strategy (stateless, decided from the current board only):
@@ -18,21 +19,36 @@
 //  4. Once the cat can no longer reach the border, stop defending and shrink its region: block the cell
 //     that leaves the cat the least room.
 // Blocking next to the cat (instead of walling the edge) caught last year's cats about 3 times faster.
+//
+// Speed: a block only reruns the pass it can change (two-distance or BFS distance), BFS distance is only
+// computed for blocks that can still make the top 5, and the lookahead skips work that can't change the
+// chosen block. None of this changes a single move.
 
 namespace {
   constexpr int kInf = INT_MAX;
   constexpr int kSearchBlocks = 5;     // best first blocks looked ahead on
   constexpr int kFollowUpBlocks = 16;  // follow-up blocks tried after each cat reply
 
+  // the two-distance part of the score: best two-distance among the cat's open neighbors, how many share
+  // it, and how many neighbors are open
+  struct Escape {
+    int bestScore = kInf;
+    int ties = 0;
+    int open = 0;
+  };
+
   struct Buffers {
     int side = 0;
     std::vector<std::array<int, 6>> neigh;  // neighbor linear indices, -1 when off the board
     std::vector<int> borders;
     std::vector<uint8_t> isBorder, open, count, cand;
+    std::vector<uint8_t> inScore, inDist;    // cells the cat's neighbors' two-distance / BFS distance depend on
     std::vector<int> score, dist;            // the current board
     std::vector<int> trialScore, trialDist;  // after a hypothetical block
     std::vector<int> nodeScore, nodeDist;    // inside the lookahead
     std::vector<int> queue, list;
+    std::vector<Escape> rootEscape;
+    std::vector<int> rootBestScore;
     std::vector<std::pair<int64_t, int>> rootValues;
   };
 
@@ -45,12 +61,13 @@ namespace {
     int h = side / 2, total = side * side;
     b.neigh.resize(total);
     b.borders.clear();
-    for (auto* v : {&b.open, &b.count, &b.cand}) {
+    for (auto* v : {&b.open, &b.count, &b.cand, &b.inScore, &b.inDist}) {
       v->resize(total);
     }
-    for (auto* v : {&b.score, &b.dist, &b.trialScore, &b.trialDist, &b.nodeScore, &b.nodeDist, &b.queue}) {
+    for (auto* v : {&b.score, &b.dist, &b.trialScore, &b.trialDist, &b.nodeScore, &b.nodeDist, &b.queue, &b.rootBestScore}) {
       v->resize(total);
     }
+    b.rootEscape.resize(total);
     b.isBorder.assign(total, 0);
     for (int i = 0; i < total; i++) {
       Point2D p = {i % side - h, i / side - h};
@@ -109,26 +126,45 @@ namespace {
     }
   }
 
-  // how good the position is for the catcher, cat on `cat` and about to move; bigger is better
-  int64_t value(const Buffers& b, int cat, const std::vector<int>& score, const std::vector<int>& dist) {
-    int bestScore = kInf, bestDist = kInf, open = 0, ties = 0;
+  Escape escapeOf(const Buffers& b, int cat, const std::vector<int>& score) {
+    Escape e;
     for (int n : b.neigh[cat]) {
       if (n < 0 || !b.open[n]) {
         continue;
       }
-      open++;
-      if (score[n] < bestScore) {
-        bestScore = score[n], ties = 1;
-      } else if (score[n] == bestScore) {
-        ties++;
+      e.open++;
+      if (score[n] < e.bestScore) {
+        e.bestScore = score[n];
+        e.ties = 1;
+      } else if (score[n] == e.bestScore) {
+        e.ties++;
       }
-      bestDist = std::min(bestDist, dist[n]);
     }
-    if (open == 0) {
+    return e;
+  }
+
+  int bestDistOf(const Buffers& b, int cat, const std::vector<int>& dist) {
+    int bestDist = kInf;
+    for (int n : b.neigh[cat]) {
+      if (n >= 0 && b.open[n]) {
+        bestDist = std::min(bestDist, dist[n]);
+      }
+    }
+    return bestDist;
+  }
+
+  // how good the position is for the catcher, cat about to move; bigger is better. The two-distance term
+  // dominates: the BFS term adds under 1000000 whenever the two-distance is finite
+  int64_t valueOf(const Escape& e, int bestDist) {
+    if (e.open == 0) {
       return INT64_MAX;  // trapped
     }
-    int64_t v = int64_t(bestScore == kInf ? 1000 : bestScore) * 1000000 + int64_t(bestDist == kInf ? 1000 : bestDist) * 1000 - open;
-    return v * 8 - ties;
+    int64_t v = int64_t(e.bestScore == kInf ? 1000 : e.bestScore) * 1000000 + int64_t(bestDist == kInf ? 1000 : bestDist) * 1000 - e.open;
+    return v * 8 - e.ties;
+  }
+
+  int64_t value(const Buffers& b, int cat, const std::vector<int>& score, const std::vector<int>& dist) {
+    return valueOf(escapeOf(b, cat, score), bestDistOf(b, cat, dist));
   }
 
   // cells reachable from the cat (the cat's own cell included), with `skip` treated as blocked
@@ -211,9 +247,32 @@ namespace {
     }
   }
 
+  // the cells one kind of value (`v`) of the cat's neighbors depends on: reachable from them by strictly
+  // decreasing `v`. Blocking any other cell leaves that kind of value unchanged at the neighbors.
+  void markSupport(Buffers& b, int cat, const std::vector<int>& v, std::vector<uint8_t>& mark) {
+    std::fill(mark.begin(), mark.end(), 0);
+    int tail = 0;
+    for (int n : b.neigh[cat]) {
+      if (n >= 0 && b.open[n]) {
+        mark[n] = 1;
+        b.queue[tail++] = n;
+      }
+    }
+    for (int head = 0; head < tail; head++) {
+      int c = b.queue[head];
+      for (int m : b.neigh[c]) {
+        if (m >= 0 && b.open[m] && !mark[m] && m != cat && v[m] < v[c]) {
+          mark[m] = 1;
+          b.queue[tail++] = m;
+        }
+      }
+    }
+  }
+
   // the catcher's best value with the cat on `cat` (cat to move after the block), over the cat's
-  // neighbors and the nearest cells its scores depend on (at most `limit` blocks tried)
-  int64_t bestFollowUp(Buffers& b, int cat, int limit) {
+  // neighbors and the nearest cells its scores depend on (at most `limit` blocks tried). Stops once it
+  // reaches `cap`: the caller only needs to know the value isn't below it.
+  int64_t bestFollowUp(Buffers& b, int cat, int limit, int64_t cap) {
     twoDistance(b, b.nodeScore);
     bfsDistance(b, b.nodeDist);
     std::fill(b.cand.begin(), b.cand.end(), 0);
@@ -236,18 +295,35 @@ namespace {
         }
       }
     }
-    int64_t best = value(b, cat, b.nodeScore, b.nodeDist);
-    int tried = 0;
-    const std::vector<int> list = b.list;
+    const Escape nodeEscape = escapeOf(b, cat, b.nodeScore);
+    const int nodeBestDist = bestDistOf(b, cat, b.nodeDist);
+    int64_t best = valueOf(nodeEscape, nodeBestDist);
+    if (best >= cap) {
+      return best;
+    }
+    std::vector<int> list = b.list;
+    if (static_cast<int>(list.size()) > limit) {
+      list.resize(limit);
+    }
+    markSupport(b, cat, b.nodeScore, b.inScore);
+    markSupport(b, cat, b.nodeDist, b.inDist);
     for (int y : list) {
-      if (tried++ >= limit) {
-        break;
-      }
       b.open[y] = 0;
-      twoDistance(b, b.trialScore);
-      bfsDistance(b, b.trialDist);
-      best = std::max(best, value(b, cat, b.trialScore, b.trialDist));
+      Escape e = nodeEscape;
+      if (b.inScore[y]) {
+        twoDistance(b, b.trialScore);
+        e = escapeOf(b, cat, b.trialScore);
+      }
+      int bestDist = nodeBestDist;
+      if (b.inDist[y] && e.open > 0) {
+        bfsDistance(b, b.trialDist);
+        bestDist = bestDistOf(b, cat, b.trialDist);
+      }
       b.open[y] = 1;
+      best = std::max(best, valueOf(e, bestDist));
+      if (best >= cap) {
+        return best;
+      }
     }
     return best;
   }
@@ -266,7 +342,9 @@ Point2D Catcher::Move(CatWorld* world) {
 
   twoDistance(b, b.score);
   bfsDistance(b, b.dist);
-  const int64_t base = value(b, cat, b.score, b.dist);
+  const Escape baseEscape = escapeOf(b, cat, b.score);
+  const int baseBestDist = bestDistOf(b, cat, b.dist);
+  const int64_t base = valueOf(baseEscape, baseBestDist);
 
   // sealed in: no neighbor of the cat reaches the border anymore
   bool sealed = true;
@@ -282,8 +360,34 @@ Point2D Catcher::Move(CatWorld* world) {
     }
   }
 
-  // greedy pass over every open cell; cells that can't change the score keep the base value
+  // first pass: the two-distance part for every candidate (rerun only where a block can change it)
   markCandidates(b, cat);
+  markSupport(b, cat, b.score, b.inScore);
+  markSupport(b, cat, b.dist, b.inDist);
+  std::vector<int> candidateScores;
+  for (int i = 0; i < total; i++) {
+    if (!b.open[i] || i == cat || !b.cand[i]) {
+      continue;
+    }
+    Escape e = baseEscape;
+    if (b.inScore[i]) {
+      b.open[i] = 0;
+      twoDistance(b, b.trialScore);
+      e = escapeOf(b, cat, b.trialScore);
+      b.open[i] = 1;
+    }
+    b.rootEscape[i] = e;
+    b.rootBestScore[i] = e.open == 0 ? INT_MAX : e.bestScore;  // a trapping block outranks everything
+    candidateScores.push_back(b.rootBestScore[i]);
+  }
+  // candidates with a lower two-distance than the 5th best can't be the best block or reach the lookahead
+  int scoreCut = INT_MIN;
+  if (static_cast<int>(candidateScores.size()) > kSearchBlocks) {
+    std::nth_element(candidateScores.begin(), candidateScores.begin() + (kSearchBlocks - 1), candidateScores.end(), std::greater<int>());
+    scoreCut = candidateScores[kSearchBlocks - 1];
+  }
+
+  // second pass: full values; cells that can't change the score keep the base value
   int best = -1;
   int64_t bestValue = INT64_MIN;
   b.rootValues.clear();
@@ -291,14 +395,21 @@ Point2D Catcher::Move(CatWorld* world) {
     if (!b.open[i] || i == cat) {
       continue;
     }
+    if (b.cand[i] && b.rootBestScore[i] < scoreCut) {
+      continue;
+    }
     int64_t v = base;
     if (b.cand[i]) {
-      b.open[i] = 0;
-      twoDistance(b, b.trialScore);
-      bfsDistance(b, b.trialDist);
-      v = value(b, cat, b.trialScore, b.trialDist);
+      const Escape& e = b.rootEscape[i];
+      int bestDist = baseBestDist;
+      if (b.inDist[i] && e.open > 0) {
+        b.open[i] = 0;
+        bfsDistance(b, b.trialDist);
+        bestDist = bestDistOf(b, cat, b.trialDist);
+        b.open[i] = 1;
+      }
+      v = valueOf(e, bestDist);
       b.rootValues.push_back({v, i});
-      b.open[i] = 1;
     }
     if (v > bestValue) {
       bestValue = v;
@@ -314,16 +425,29 @@ Point2D Catcher::Move(CatWorld* world) {
     for (int k = 0; k < static_cast<int>(roots.size()) && k < kSearchBlocks; k++) {
       int x = roots[k].second;
       b.open[x] = 0;
-      int64_t worst = INT64_MAX;
+      // the cat's replies, most dangerous (lowest two-distance) first, so hopeless blocks are dropped sooner
+      twoDistance(b, b.trialScore);
+      std::array<std::pair<int, int>, 6> replies;
+      int replyCount = 0;
+      bool escapes = false;
       for (int m : b.neigh[cat]) {
         if (m < 0 || !b.open[m]) {
           continue;
         }
         if (b.isBorder[m]) {
-          worst = INT64_MIN;  // the cat escapes
-          break;
+          escapes = true;
         }
-        worst = std::min(worst, bestFollowUp(b, m, kFollowUpBlocks));
+        replies[replyCount++] = {b.trialScore[m], m};
+      }
+      std::stable_sort(replies.begin(), replies.begin() + replyCount, [](const auto& a, const auto& c) { return a.first < c.first; });
+      int64_t worst = INT64_MAX;
+      if (escapes) {
+        worst = INT64_MIN;  // the cat escapes
+      } else {
+        // stop once this block can no longer beat the best one found so far
+        for (int r = 0; r < replyCount && worst > bestWorst; r++) {
+          worst = std::min(worst, bestFollowUp(b, replies[r].second, kFollowUpBlocks, worst));
+        }
       }
       b.open[x] = 1;
       if (worst > bestWorst) {
