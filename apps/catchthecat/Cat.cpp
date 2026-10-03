@@ -5,6 +5,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <queue>
 #include <vector>
@@ -86,50 +87,152 @@ namespace {
     return b;
   }
 
+  // Distance passes
+  // Raw pointers instead of vector calls, and the 6 neighbors written out instead of looped. `neigh` is 6 ints per cell, -1 off the board.
   // cells leave the queue in nondecreasing score, so the second neighbor to leave is the second best one
-  void twoDistance(Buffers& b, std::vector<int>& score) {
-    std::fill(score.begin(), score.end(), kInf);
-    std::fill(b.count.begin(), b.count.end(), 0);
+  void rawTwoDistance(const int* neigh, const int* borders, int borderCount, const uint8_t* open, int total, int* score, uint8_t* count, int* queue) {
+    for (int i = 0; i < total; i++) {
+      score[i] = kInf;
+    }
+    memset(count, 0, total);
     int tail = 0;
-    for (int i : b.borders) {
-      if (b.open[i]) {
+    for (int k = 0; k < borderCount; k++) {
+      const int i = borders[k];
+      if (open[i]) {
         score[i] = 0;
-        b.queue[tail++] = i;
+        queue[tail] = i;
+        tail++;
       }
     }
     for (int head = 0; head < tail; head++) {
-      int c = b.queue[head];
-      for (int m : b.neigh[c]) {
-        if (m < 0 || !b.open[m] || score[m] != kInf) {
-          continue;
+      const int c = queue[head];
+      const int next = score[c] + 1;
+      const int* nb = neigh + c * 6;
+      const int m0 = nb[0];
+      if (m0 >= 0 && open[m0] && score[m0] == kInf) {
+        count[m0]++;
+        if (count[m0] == 2) {
+          score[m0] = next;
+          queue[tail] = m0;
+          tail++;
         }
-        if (++b.count[m] == 2) {
-          score[m] = score[c] + 1;
-          b.queue[tail++] = m;
+      }
+      const int m1 = nb[1];
+      if (m1 >= 0 && open[m1] && score[m1] == kInf) {
+        count[m1]++;
+        if (count[m1] == 2) {
+          score[m1] = next;
+          queue[tail] = m1;
+          tail++;
+        }
+      }
+      const int m2 = nb[2];
+      if (m2 >= 0 && open[m2] && score[m2] == kInf) {
+        count[m2]++;
+        if (count[m2] == 2) {
+          score[m2] = next;
+          queue[tail] = m2;
+          tail++;
+        }
+      }
+      const int m3 = nb[3];
+      if (m3 >= 0 && open[m3] && score[m3] == kInf) {
+        count[m3]++;
+        if (count[m3] == 2) {
+          score[m3] = next;
+          queue[tail] = m3;
+          tail++;
+        }
+      }
+      const int m4 = nb[4];
+      if (m4 >= 0 && open[m4] && score[m4] == kInf) {
+        count[m4]++;
+        if (count[m4] == 2) {
+          score[m4] = next;
+          queue[tail] = m4;
+          tail++;
+        }
+      }
+      const int m5 = nb[5];
+      if (m5 >= 0 && open[m5] && score[m5] == kInf) {
+        count[m5]++;
+        if (count[m5] == 2) {
+          score[m5] = next;
+          queue[tail] = m5;
+          tail++;
         }
       }
     }
   }
 
-  void bfsDistance(Buffers& b) {
-    std::fill(b.dist.begin(), b.dist.end(), kInf);
+  // BFS distance from the open border cells; cells farther than `limit` are left at kInf
+  void rawBfsDistance(const int* neigh, const int* borders, int borderCount, const uint8_t* open, int total, int* dist, int* queue, int limit) {
+    for (int i = 0; i < total; i++) {
+      dist[i] = kInf;
+    }
     int tail = 0;
-    for (int i : b.borders) {
-      if (b.open[i]) {
-        b.dist[i] = 0;
-        b.queue[tail++] = i;
+    for (int k = 0; k < borderCount; k++) {
+      const int i = borders[k];
+      if (open[i]) {
+        dist[i] = 0;
+        queue[tail] = i;
+        tail++;
       }
     }
     for (int head = 0; head < tail; head++) {
-      int c = b.queue[head];
-      for (int m : b.neigh[c]) {
-        if (m < 0 || !b.open[m] || b.dist[m] != kInf) {
-          continue;
-        }
-        b.dist[m] = b.dist[c] + 1;
-        b.queue[tail++] = m;
+      const int c = queue[head];
+      if (dist[c] >= limit) {
+        break;
+      }
+      const int next = dist[c] + 1;
+      const int* nb = neigh + c * 6;
+      const int m0 = nb[0];
+      if (m0 >= 0 && open[m0] && dist[m0] == kInf) {
+        dist[m0] = next;
+        queue[tail] = m0;
+        tail++;
+      }
+      const int m1 = nb[1];
+      if (m1 >= 0 && open[m1] && dist[m1] == kInf) {
+        dist[m1] = next;
+        queue[tail] = m1;
+        tail++;
+      }
+      const int m2 = nb[2];
+      if (m2 >= 0 && open[m2] && dist[m2] == kInf) {
+        dist[m2] = next;
+        queue[tail] = m2;
+        tail++;
+      }
+      const int m3 = nb[3];
+      if (m3 >= 0 && open[m3] && dist[m3] == kInf) {
+        dist[m3] = next;
+        queue[tail] = m3;
+        tail++;
+      }
+      const int m4 = nb[4];
+      if (m4 >= 0 && open[m4] && dist[m4] == kInf) {
+        dist[m4] = next;
+        queue[tail] = m4;
+        tail++;
+      }
+      const int m5 = nb[5];
+      if (m5 >= 0 && open[m5] && dist[m5] == kInf) {
+        dist[m5] = next;
+        queue[tail] = m5;
+        tail++;
       }
     }
+  }
+
+  void twoDistance(Buffers& b, std::vector<int>& score) {
+    rawTwoDistance(b.neigh[0].data(), b.borders.data(), static_cast<int>(b.borders.size()), b.open.data(), static_cast<int>(b.open.size()),
+                   score.data(), b.count.data(), b.queue.data());
+  }
+
+  void bfsDistance(Buffers& b) {
+    rawBfsDistance(b.neigh[0].data(), b.borders.data(), static_cast<int>(b.borders.size()), b.open.data(), static_cast<int>(b.open.size()),
+                   b.dist.data(), b.queue.data(), kInf);
   }
 
   // value of the cat standing on n with the catcher having just moved; smaller is better.
@@ -613,24 +716,9 @@ namespace {
     return nearestExit(b, s, cat, false, -1);
   }
 
-  void borderDistInto(const Buffers& b, std::vector<int>& d, std::vector<int>& q) {
-    std::fill(d.begin(), d.end(), kInf);
-    int tail = 0;
-    for (int i : b.borders) {
-      if (b.open[i]) {
-        d[i] = 0;
-        q[tail++] = i;
-      }
-    }
-    for (int head = 0; head < tail; head++) {
-      int c = q[head];
-      for (int m : b.neigh[c]) {
-        if (m >= 0 && b.open[m] && d[m] == kInf) {
-          d[m] = d[c] + 1;
-          q[tail++] = m;
-        }
-      }
-    }
+  void borderDistInto(const Buffers& b, std::vector<int>& d, std::vector<int>& q, int limit) {
+    rawBfsDistance(b.neigh[0].data(), b.borders.data(), static_cast<int>(b.borders.size()), b.open.data(), static_cast<int>(b.open.size()), d.data(),
+                   q.data(), limit);
   }
 
   bool trappedAt(const Buffers& b, int cat) {
@@ -643,12 +731,13 @@ namespace {
   }
 
   // cat on `cat` to move, `depth` cat moves left: is there a line that beats this model?
+  // only cells within depth - 1 of the border matter, so the distance pass stops there
   bool beatsModel(Buffers& b, ModelScratch& s, int cat, int model, int depth, int& budget) {
     if (depth <= 0 || --budget < 0) {
       return false;
     }
     auto& d = s.depthDist[depth];
-    borderDistInto(b, d, s.modelQueue);
+    borderDistInto(b, d, s.modelQueue, depth - 1);
     for (int n : b.neigh[cat]) {
       if (n < 0 || !b.open[n] || d[n] > depth - 1) {
         continue;  // too far to arrive in time
