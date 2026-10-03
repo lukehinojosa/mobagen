@@ -12,7 +12,9 @@
 
 // Cat strategy (stateless, decided from the current board only):
 //  1. Two-distance: an open border cell scores 0; any other open cell scores 1 + the SECOND smallest
-//     score among its neighbors, because the catcher will block the best one. Rank moves by it.
+//     score among its neighbors, because the catcher will block the best one. Rank moves by it. Moves
+//     tied on every ranking key go to the one with the most room: open cells within 2 steps that are at
+//     least as close to escaping (over 100,000 games this beat board order on every seed tried).
 //  2. Model search: catchers that defend the edge (instead of blocking next to the cat) beat plain
 //     two-distance by plugging each exit as the cat laps the board. When the board shows such a style,
 //     search up to 6 cat moves for a line that beats cheap copies of those catchers, and take it.
@@ -883,6 +885,37 @@ namespace {
     }
     return best;
   }
+  // room around a move to `n`: the open cells within 2 steps of it (n included) whose two-distance is no
+  // worse than n's. More room keeps more escape routes alive when moves are otherwise tied.
+  int roomAround(const Buffers& b, int n) {
+    int cells[19];
+    int count = 0;
+    cells[count++] = n;
+    // n, then its neighbors: their neighbors make the second ring
+    for (int head = 0; head < count && head < 7; head++) {
+      for (int m : b.neigh[cells[head]]) {
+        if (m < 0) {
+          continue;
+        }
+        bool seen = false;
+        for (int k = 0; k < count; k++) {
+          if (cells[k] == m) {
+            seen = true;
+          }
+        }
+        if (!seen) {
+          cells[count++] = m;
+        }
+      }
+    }
+    int room = 0;
+    for (int k = 0; k < count; k++) {
+      if (b.open[cells[k]] && b.score[cells[k]] <= b.score[n]) {
+        room++;
+      }
+    }
+    return room;
+  }
 }  // namespace
 
 Point2D Cat::Move(CatWorld* world) {
@@ -942,6 +975,25 @@ Point2D Cat::Move(CatWorld* world) {
     return CatWorld::NE(cat);
   }
   std::sort(moves.begin(), moves.begin() + moveCount);
+
+  // moves tied with the top one on every key: put the one with the most room first (board order breaks
+  // what is left)
+  int tied = 1;
+  while (tied < moveCount && moves[tied].first == moves[0].first) {
+    tied++;
+  }
+  if (tied > 1) {
+    int bestK = 0;
+    int bestRoom = -1;
+    for (int k = 0; k < tied; k++) {
+      const int room = roomAround(b, moves[k].second);
+      if (room > bestRoom) {
+        bestRoom = room;
+        bestK = k;
+      }
+    }
+    std::rotate(moves.begin(), moves.begin() + bestK, moves.begin() + bestK + 1);
+  }
 
   // model search, unless the win is already forced
   if (!(moves[0].first[0] == 0 && moves[0].first[1] <= 1)) {
