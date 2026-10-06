@@ -9,7 +9,7 @@
 #include <functional>
 #include <vector>
 
-// Catcher strategy (stateless, decided from the current board only):
+// Catcher strategy:
 //  1. Score a position by the cat's two-distance (an open border cell scores 0; any other open cell
 //     scores 1 + the second smallest score among its neighbors), then its BFS distance, then how many of
 //     its neighbors share the best score and how many are open. Bigger is better for the catcher.
@@ -21,6 +21,9 @@
 //     that follows its shortest path (the generatePath cat).
 //  4. Once the cat can no longer reach the border, stop defending and shrink its region: block the cell
 //     that leaves the cat the least room.
+//  5. Once the chosen block leaves the cat no finite two-distance (it can't force an escape), switch to the
+//     block within 2 steps of the cat, among those that also leave it none, that traps a plain two-distance
+//     cat soonest in a playout where the catcher blocks the cat's best next cell.
 // Blocking next to the cat (instead of walling the edge) caught last year's cats about 3 times faster.
 //
 // Speed: a block only reruns the pass it can change (two-distance or BFS distance), BFS distance is only
@@ -34,6 +37,12 @@ namespace {
   constexpr int kFollowUpBlocks = 16;    // follow-up blocks tried after each cat reply
   constexpr int kSearchDepth = 2;        // catcher moves looked ahead after the first block
   constexpr int kDeepFollowUps = 2;      // follow-up blocks given the deeper look at each level
+  constexpr int kModelRadius = 2;        // model playouts try the open cells this many steps from the cat
+  constexpr int kModelMoves = 40;        // cat moves a model playout runs at most
+  constexpr int kModelEscape = 1 << 20;  // a model playout's length when the cat gets out
+
+  // cells within kModelRadius steps of the cat
+  constexpr int kModelCells = 1 + 3 * kModelRadius * (kModelRadius + 1);
 
   // the two-distance part of the score: best two-distance among the cat's open neighbors, how many share
   // it, and how many neighbors are open
@@ -561,6 +570,168 @@ namespace {
     }
     return best;
   }
+
+  // Model Playouts: once the cat can't force an escape, catch a plain two-distance cat fastest
+
+  // the cat's best next cell on this board: lowest two-distance, then BFS distance, then most open neighbors; -1 when it has no open neighbor
+  int bestNextCell(const Buffers& b, int cat) {
+    int best = -1;
+    int64_t bestKey = INT64_MAX;
+    for (int n : b.neigh[cat]) {
+      if (!b.open[n]) {
+        continue;
+      }
+      const int64_t score = b.nodeScore[n] >= kBlocked ? 1000 : b.nodeScore[n];
+      const int64_t dist = b.nodeDist[n] >= kBlocked ? 1000 : b.nodeDist[n];
+      const int64_t key = (score * 1024 + dist) * 8 + (6 - openAround(b, n, -1));
+      if (key < bestKey) {
+        bestKey = key;
+        best = n;
+      }
+    }
+    return best;
+  }
+
+  // the model cat's move: a border cell if it can reach one, else its best next cell; -1 when it is trapped
+  int modelCatMove(Buffers& b, int cat) {
+    twoDistance(b, b.nodeScore);
+    bfsDistance(b, b.nodeDist);
+    for (int n : b.neigh[cat]) {
+      if (b.open[n] && b.isBorder[n]) {
+        return n;
+      }
+    }
+    return bestNextCell(b, cat);
+  }
+
+  // Runs until the model cat is trapped (cat to move on `cat`); kModelEscape if it gets out. Stops at
+  // `cutoff` once the playout can no longer end sooner than that, since the caller only keeps a shorter one.
+  int playout(Buffers& b, int cat, int cutoff) {
+    int placed[kModelMoves];
+    int count = 0;
+    int plies = 0;
+    int result = -1;
+    for (int t = 0; t < kModelMoves && result < 0; t++) {
+      if (plies + 2 >= cutoff) {
+        result = cutoff;
+        break;
+      }
+      const int m = modelCatMove(b, cat);
+      if (m < 0) {
+        result = plies;
+        break;
+      }
+      cat = m;
+      plies++;
+      if (b.isBorder[m]) {
+        result = kModelEscape;
+        break;
+      }
+      // The playout catcher blocks the cat's best next cell, from the distances modelCatMove just computed.
+      // About 10 times cheaper per playout move than a real catcher, and its playouts ranked the blocks better.
+      const int x = bestNextCell(b, cat);
+      if (x < 0 || !b.open[x] || x == cat) {
+        result = kModelEscape;
+        break;
+      }
+      setOpen(b, x, false);
+      placed[count++] = x;
+      plies++;
+      if (openAround(b, cat, -1) == 0) {
+        result = plies;
+      }
+    }
+    if (result < 0) {
+      result = plies + 1000;  // not caught within the playout: long
+    }
+    for (int k = count - 1; k >= 0; k--) {
+      setOpen(b, placed[k], true);
+    }
+    return result;
+  }
+
+  // after blocking x, does every open neighbor of the cat have an infinite two-distance (no forced escape)?
+  bool keepsCatIn(Buffers& b, int cat, int x) {
+    setOpen(b, x, false);
+    twoDistance(b, b.trialScore);
+    const Escape e = escapeOf(b, cat, b.trialScore);
+    setOpen(b, x, true);
+    return e.open == 0 || e.bestScore == kInf;
+  }
+
+  // the block to play instead of `best`: among blocks within kModelRadius steps of the cat that keep it from
+  // forcing an escape, the one whose playout traps the model cat soonest (`best` wins ties)
+  int modelBlock(Buffers& b, int cat, int best) {
+    // blocking only raises two-distances, so if every escape is already shut any block keeps it shut, and a
+    // block outside the cells the cat's neighbors' two-distances are built from can't shut an open one; the
+    // pass only runs for the rest. b.score is still this board's two-distance.
+    bool allShut = true;
+    for (int n : b.neigh[cat]) {
+      if (b.open[n] && b.score[n] != kInf) {
+        allShut = false;
+      }
+    }
+    if (!allShut) {
+      markSupport(b, cat, b.score, b.inScore);
+      if (!b.inScore[best] || !keepsCatIn(b, cat, best)) {
+        return best;
+      }
+    }
+    // the cells within kModelRadius steps, nearest first (19 for a radius of 2)
+    int cells[kModelCells];
+    int steps[kModelCells];
+    int count = 0;
+    cells[count] = cat;
+    steps[count] = 0;
+    count++;
+    const int total = b.side * b.side;
+    for (int head = 0; head < count; head++) {
+      if (steps[head] == kModelRadius) {
+        continue;
+      }
+      for (int m : b.neigh[cells[head]]) {
+        if (m >= total) {
+          continue;
+        }
+        bool seen = false;
+        for (int k = 0; k < count; k++) {
+          if (cells[k] == m) {
+            seen = true;
+          }
+        }
+        if (!seen) {
+          cells[count] = m;
+          steps[count] = steps[head] + 1;
+          count++;
+        }
+      }
+    }
+    // decided before the playouts, which reuse inScore
+    bool keeps[kModelCells];
+    for (int k = 1; k < count; k++) {
+      const int x = cells[k];
+      keeps[k] = x != best && b.open[x] && (allShut || (b.inScore[x] && keepsCatIn(b, cat, x)));
+    }
+    setOpen(b, best, false);
+    int pickLen = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, INT_MAX);
+    setOpen(b, best, true);
+    int pick = best;
+    for (int k = 1; k < count; k++) {
+      const int x = cells[k];
+      if (!keeps[k]) {
+        continue;
+      }
+      setOpen(b, x, false);
+      const int len = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, pickLen);
+      setOpen(b, x, true);
+      if (len < pickLen) {
+        pickLen = len;
+        pick = x;
+      }
+    }
+    return pick;
+  }
+
 }  // namespace
 
 Point2D Catcher::Move(CatWorld* world) {
@@ -724,5 +895,6 @@ Point2D Catcher::Move(CatWorld* world) {
   if (best < 0) {
     return {catPos.x == h ? catPos.x - 1 : catPos.x + 1, catPos.y};  // nothing legal is left
   }
+  best = modelBlock(b, cat, best);
   return toPoint(best);
 }
