@@ -22,10 +22,12 @@
 //  4. Once the cat can no longer reach the border, stop defending and shrink its region: block the cell
 //     that leaves the cat the least room.
 //  5. Once the chosen block leaves the cat no finite two-distance (it can't force an escape), switch to the
-//     block within 2 steps of the cat, among those that also leave it none, that traps a plain two-distance
-//     cat soonest in a playout where the catcher blocks the cat's best next cell.
-//  6. Before that, take the block within 2 steps whose playout traps that cat sooner, if the lookahead of
-//     step 3 rates its worst case as good as the chosen block's.
+//     block within 3 steps of the cat, among those that also leave it none, that traps a plain two-distance
+//     cat soonest in a playout. The playout catcher is steps 1, 2 and 4 without the lookahead, trying only
+//     blocks within 2 steps of the cat.
+//  6. Before that, take the block within 3 steps whose playout traps that cat sooner, if the lookahead of
+//     step 3 rates its worst case at most one two-distance step below the chosen block's (up to 3 tried,
+//     shortest playout first).
 // Blocking next to the cat (instead of walling the edge) caught last year's cats about 3 times faster.
 //
 // Speed: a block only reruns the pass it can change (two-distance or BFS distance), BFS distance is only
@@ -34,15 +36,16 @@
 
 namespace {
   constexpr int kInf = INT_MAX;
-  constexpr int kBlocked = INT_MAX - 1;  // a blocked cell's value in a distance array
-  constexpr int kSearchBlocks = 5;       // best first blocks looked ahead on
-  constexpr int kFollowUpBlocks = 16;    // follow-up blocks tried after each cat reply
-  constexpr int kSearchDepth = 2;        // catcher moves looked ahead after the first block
-  constexpr int kDeepFollowUps = 2;      // follow-up blocks given the deeper look at each level
-  constexpr int kModelRadius = 2;        // model playouts try the open cells this many steps from the cat
-  constexpr int kModelMoves = 40;        // cat moves a model playout runs at most
-  constexpr int kModelEscape = 1 << 20;  // a model playout's length when the cat gets out
-  constexpr int kSafetyChecks = 3;       // early model picks checked against the root's worst case
+  constexpr int kBlocked = INT_MAX - 1;    // a blocked cell's value in a distance array
+  constexpr int kSearchBlocks = 5;         // best first blocks looked ahead on
+  constexpr int kFollowUpBlocks = 16;      // follow-up blocks tried after each cat reply
+  constexpr int kSearchDepth = 2;          // catcher moves looked ahead after the first block
+  constexpr int kDeepFollowUps = 2;        // follow-up blocks given the deeper look at each level
+  constexpr int kModelRadius = 3;          // model playouts try the open cells this many steps from the cat
+  constexpr int kModelMoves = 40;          // cat moves a model playout runs at most
+  constexpr int kModelEscape = 1 << 20;    // a model playout's length when the cat gets out
+  constexpr int kSafetyChecks = 3;         // early model picks checked against the root's worst case
+  constexpr int64_t kScoreStep = 8000000;  // one two-distance step in a value (see valueOf)
 
   // cells within kModelRadius steps of the cat
   constexpr int kModelCells = 1 + 3 * kModelRadius * (kModelRadius + 1);
@@ -574,6 +577,173 @@ namespace {
     return best;
   }
 
+  // Search
+
+  // steps 1 to 4 on the current board: the block to play before the model step (-1 if none), the chosen
+  // block's worst case in rootWorst (INT64_MIN when the lookahead didn't run), and trapping set when the cat
+  // is sealed in and the block shrinks its region. 'playoutCatcher' skips the lookahead and only tries blocks within 2 steps of the cat.
+  int searchBlock(Buffers& b, int cat, bool playoutCatcher, int64_t& rootWorst, bool& trapping) {
+    const int total = b.side * b.side;
+    rootWorst = INT64_MIN;
+    trapping = false;
+    twoDistance(b, b.score);
+    bfsDistance(b, b.dist);
+    const Escape baseEscape = escapeOf(b, cat, b.score);
+    const int baseBestDist = bestDistOf(b, cat, b.dist);
+    const int64_t base = valueOf(baseEscape, baseBestDist);
+
+    // sealed in: no neighbor of the cat reaches the border anymore
+    bool sealed = true;
+    for (int n : b.neigh[cat]) {
+      if (n >= 0 && b.open[n] && b.dist[n] != kInf) {
+        sealed = false;
+      }
+    }
+    if (sealed) {
+      int t = trapMove(b, cat);
+      if (t >= 0) {
+        trapping = true;
+        return t;
+      }
+    }
+
+    // first pass: the two-distance part for every candidate (rerun only where a block can change it)
+    markCandidates(b, cat);
+    if (playoutCatcher) {
+      // only the cells within 2 steps of the cat (inScore is scratch until markSupport fills it)
+      std::fill(b.inScore.begin(), b.inScore.end(), 0);
+      for (int n : b.neigh[cat]) {
+        b.inScore[n] = 1;
+        for (int m : b.neigh[n]) {
+          b.inScore[m] = 1;
+        }
+      }
+      for (int i = 0; i < total; i++) {
+        b.cand[i] = b.cand[i] && b.inScore[i];
+      }
+    }
+    markSupport(b, cat, b.score, b.inScore);
+    markSupport(b, cat, b.dist, b.inDist);
+    std::vector<int> candidateScores;
+    for (int i = 0; i < total; i++) {
+      if (!b.open[i] || i == cat || !b.cand[i]) {
+        continue;
+      }
+      Escape e = baseEscape;
+      if (b.inScore[i]) {
+        setOpen(b, i, false);
+        twoDistance(b, b.trialScore);
+        e = escapeOf(b, cat, b.trialScore);
+        setOpen(b, i, true);
+      }
+      b.rootEscape[i] = e;
+      b.rootBestScore[i] = e.open == 0 ? INT_MAX : e.bestScore;  // a trapping block outranks everything
+      candidateScores.push_back(b.rootBestScore[i]);
+    }
+    // candidates with a lower two-distance than the 5th best can't be the best block or reach the lookahead
+    int scoreCut = INT_MIN;
+    if (static_cast<int>(candidateScores.size()) > kSearchBlocks) {
+      std::nth_element(candidateScores.begin(), candidateScores.begin() + (kSearchBlocks - 1), candidateScores.end(), std::greater<int>());
+      scoreCut = candidateScores[kSearchBlocks - 1];
+    }
+
+    // second pass: full values; cells that can't change the score keep the base value
+    int best = -1;
+    int64_t bestValue = INT64_MIN;
+    b.rootValues.clear();
+    for (int i = 0; i < total; i++) {
+      if (!b.open[i] || i == cat) {
+        continue;
+      }
+      if (b.cand[i] && b.rootBestScore[i] < scoreCut) {
+        continue;
+      }
+      int64_t v = base;
+      if (b.cand[i]) {
+        const Escape& e = b.rootEscape[i];
+        int bestDist = baseBestDist;
+        if (b.inDist[i] && e.open > 0) {
+          setOpen(b, i, false);
+          bfsDistance(b, b.trialDist);
+          bestDist = bestDistOf(b, cat, b.trialDist);
+          setOpen(b, i, true);
+        }
+        v = valueOf(e, bestDist);
+        b.rootValues.push_back({v, i});
+      }
+      if (v > bestValue) {
+        bestValue = v;
+        best = i;
+      }
+    }
+
+    // lookahead on the best few blocks, unless one of them already traps the cat
+    if (bestValue != INT64_MAX && !playoutCatcher) {
+      std::stable_sort(b.rootValues.begin(), b.rootValues.end(), [](const auto& a, const auto& c) { return a.first > c.first; });
+      const auto roots = b.rootValues;
+      int64_t bestWorst = INT64_MIN;
+      std::array<int64_t, 16> worstOf;
+      const int rootCount = std::min<int>(static_cast<int>(roots.size()), kSearchBlocks);
+      for (int k = 0; k < rootCount; k++) {
+        int x = roots[k].second;
+        setOpen(b, x, false);
+        std::array<std::pair<int, int>, 6> replies;
+        int replyCount = 0;
+        int64_t worst = INT64_MIN;  // the cat escapes unless catReplies says otherwise
+        if (catReplies(b, cat, replies, replyCount)) {
+          worst = INT64_MAX;
+          // stop once this block can no longer match the best one found so far (a tie still counts: the
+          // tie-break below needs its exact worst case)
+          for (int r = 0; r < replyCount && worst >= bestWorst; r++) {
+            worst = std::min(worst, catcherValue(b, replies[r].second, kSearchDepth, worst == bestWorst ? INT64_MAX : worst));
+          }
+        }
+        setOpen(b, x, true);
+        worstOf[k] = worst;
+        if (worst > bestWorst) {
+          bestWorst = worst;
+          best = x;
+        }
+      }
+
+      rootWorst = bestWorst;
+
+      // cat model tie-break: among blocks with the same worst case, the one that does best against a cat
+      // that follows its shortest path (the generatePath cat)
+      if (bestWorst != INT64_MIN) {
+        int ties = 0;
+        for (int k = 0; k < rootCount; k++) {
+          ties += worstOf[k] == bestWorst;
+        }
+        if (ties > 1) {
+          int64_t bestModel = INT64_MIN;
+          for (int k = 0; k < rootCount; k++) {
+            if (worstOf[k] != bestWorst) {
+              continue;
+            }
+            int x = roots[k].second;
+            setOpen(b, x, false);
+            bfsDistance(b, b.trialDist);
+            int step = -1;
+            for (int m : b.neigh[cat]) {
+              if (m >= 0 && b.open[m] && (step < 0 || b.trialDist[m] < b.trialDist[step])) {
+                step = m;
+              }
+            }
+            int64_t modelValue = step < 0 ? INT64_MAX : catcherValue(b, step, 1, INT64_MAX);
+            setOpen(b, x, true);
+            if (modelValue > bestModel) {
+              bestModel = modelValue;
+              best = x;
+            }
+          }
+        }
+      }
+    }
+
+    return best;
+  }
+
   // Model Playouts: once the cat can't force an escape, catch a plain two-distance cat fastest
 
   // the cat's best next cell on this board: lowest two-distance, then BFS distance, then most open neighbors; -1 when it has no open neighbor
@@ -630,9 +800,12 @@ namespace {
         result = kModelEscape;
         break;
       }
-      // The playout catcher blocks the cat's best next cell, from the distances modelCatMove just computed.
-      // About 10 times cheaper per playout move than a real catcher, and its playouts ranked the blocks better.
-      const int x = bestNextCell(b, cat);
+      // the playout catcher: this catcher without the lookahead, blocking within 2 steps of the cat. Its playouts rank blocks far better than ones
+      // where the catcher just blocks the cat's best next cell, at about a fortieth of the cost of playin out with the full search, which caught
+      // them barely sooner.
+      int64_t worst = INT64_MIN;
+      bool trapping = false;
+      const int x = searchBlock(b, cat, true, worst, trapping);
       if (x < 0 || !b.open[x] || x == cat) {
         result = kModelEscape;
         break;
@@ -662,8 +835,8 @@ namespace {
     return e.open == 0 || e.bestScore == kInf;
   }
 
-  // The cells within kModelRadius steps of the cat, nearest first, the cat's own cell at 0 (19 for a radius
-  // of 2); returns how many
+  // The cells within kModelRadius steps of the cat, nearest first, the cat's own cell at 0 (37 for a radius
+  // of 3); returns how many
   int cellsNear(const Buffers& b, int cat, int* cells) {
     int steps[kModelCells];
     int count = 0;
@@ -714,12 +887,14 @@ namespace {
   }
 
   // before the escape is shut: the blocks within kModelRadius steps whose playouts trap the model cat sooner
-  // than `best`'s, shortest first, and the first of up to kSafetyChecks whose worst case is as good as
-  // `best`'s (rootWorst).
+  // than `best`'s, shortest first, and the first of up to kSafetyChecks whose worst case is at most one
+  // two-distance step below `best`'s (rootWorst). Demanding a worst case as good as `best`'s turned away
+  // nearly every faster block once the playouts used a real catcher.
   int earlyBlock(Buffers& b, int cat, int best, int64_t rootWorst) {
     if (rootWorst == INT64_MIN) {
       return best;
     }
+    const int64_t need = (rootWorst / kScoreStep - 1) * kScoreStep;  // one two-distance step below
     int cells[kModelCells];
     const int count = cellsNear(b, cat, cells);
     setOpen(b, best, false);
@@ -741,7 +916,7 @@ namespace {
     }
     std::stable_sort(better.begin(), better.begin() + betterCount);
     for (int k = 0; k < betterCount && k < kSafetyChecks; k++) {
-      if (worstAtLeast(b, cat, better[k].second, rootWorst)) {
+      if (worstAtLeast(b, cat, better[k].second, need)) {
         return better[k].second;
       }
     }
@@ -808,146 +983,11 @@ Point2D Catcher::Move(CatWorld* world) {
   const int cat = (catPos.y + h) * side + catPos.x + h;
   auto toPoint = [&](int i) { return Point2D{i % side - h, i / side - h}; };
 
-  twoDistance(b, b.score);
-  bfsDistance(b, b.dist);
-  const Escape baseEscape = escapeOf(b, cat, b.score);
-  const int baseBestDist = bestDistOf(b, cat, b.dist);
-  const int64_t base = valueOf(baseEscape, baseBestDist);
-
-  // sealed in: no neighbor of the cat reaches the border anymore
-  bool sealed = true;
-  for (int n : b.neigh[cat]) {
-    if (n >= 0 && b.open[n] && b.dist[n] != kInf) {
-      sealed = false;
-    }
-  }
-  if (sealed) {
-    int t = trapMove(b, cat);
-    if (t >= 0) {
-      return toPoint(t);
-    }
-  }
-
-  // first pass: the two-distance part for every candidate (rerun only where a block can change it)
-  markCandidates(b, cat);
-  markSupport(b, cat, b.score, b.inScore);
-  markSupport(b, cat, b.dist, b.inDist);
-  std::vector<int> candidateScores;
-  for (int i = 0; i < total; i++) {
-    if (!b.open[i] || i == cat || !b.cand[i]) {
-      continue;
-    }
-    Escape e = baseEscape;
-    if (b.inScore[i]) {
-      setOpen(b, i, false);
-      twoDistance(b, b.trialScore);
-      e = escapeOf(b, cat, b.trialScore);
-      setOpen(b, i, true);
-    }
-    b.rootEscape[i] = e;
-    b.rootBestScore[i] = e.open == 0 ? INT_MAX : e.bestScore;  // a trapping block outranks everything
-    candidateScores.push_back(b.rootBestScore[i]);
-  }
-  // candidates with a lower two-distance than the 5th best can't be the best block or reach the lookahead
-  int scoreCut = INT_MIN;
-  if (static_cast<int>(candidateScores.size()) > kSearchBlocks) {
-    std::nth_element(candidateScores.begin(), candidateScores.begin() + (kSearchBlocks - 1), candidateScores.end(), std::greater<int>());
-    scoreCut = candidateScores[kSearchBlocks - 1];
-  }
-
-  // second pass: full values; cells that can't change the score keep the base value
-  int best = -1;
-  int64_t bestValue = INT64_MIN;
-  b.rootValues.clear();
-  for (int i = 0; i < total; i++) {
-    if (!b.open[i] || i == cat) {
-      continue;
-    }
-    if (b.cand[i] && b.rootBestScore[i] < scoreCut) {
-      continue;
-    }
-    int64_t v = base;
-    if (b.cand[i]) {
-      const Escape& e = b.rootEscape[i];
-      int bestDist = baseBestDist;
-      if (b.inDist[i] && e.open > 0) {
-        setOpen(b, i, false);
-        bfsDistance(b, b.trialDist);
-        bestDist = bestDistOf(b, cat, b.trialDist);
-        setOpen(b, i, true);
-      }
-      v = valueOf(e, bestDist);
-      b.rootValues.push_back({v, i});
-    }
-    if (v > bestValue) {
-      bestValue = v;
-      best = i;
-    }
-  }
-
-  // lookahead on the best few blocks, unless one of them already traps the cat
   int64_t rootWorst = INT64_MIN;  // the chosen block's worst case, for modelBlock
-  if (bestValue != INT64_MAX) {
-    std::stable_sort(b.rootValues.begin(), b.rootValues.end(), [](const auto& a, const auto& c) { return a.first > c.first; });
-    const auto roots = b.rootValues;
-    int64_t bestWorst = INT64_MIN;
-    std::array<int64_t, 16> worstOf;
-    const int rootCount = std::min<int>(static_cast<int>(roots.size()), kSearchBlocks);
-    for (int k = 0; k < rootCount; k++) {
-      int x = roots[k].second;
-      setOpen(b, x, false);
-      std::array<std::pair<int, int>, 6> replies;
-      int replyCount = 0;
-      int64_t worst = INT64_MIN;  // the cat escapes unless catReplies says otherwise
-      if (catReplies(b, cat, replies, replyCount)) {
-        worst = INT64_MAX;
-        // stop once this block can no longer match the best one found so far (a tie still counts: the
-        // tie-break below needs its exact worst case)
-        for (int r = 0; r < replyCount && worst >= bestWorst; r++) {
-          worst = std::min(worst, catcherValue(b, replies[r].second, kSearchDepth, worst == bestWorst ? INT64_MAX : worst));
-        }
-      }
-      setOpen(b, x, true);
-      worstOf[k] = worst;
-      if (worst > bestWorst) {
-        bestWorst = worst;
-        best = x;
-      }
-    }
-
-    rootWorst = bestWorst;
-
-    // cat model tie-break: among blocks with the same worst case, the one that does best against a cat
-    // that follows its shortest path (the generatePath cat)
-    if (bestWorst != INT64_MIN) {
-      int ties = 0;
-      for (int k = 0; k < rootCount; k++) {
-        ties += worstOf[k] == bestWorst;
-      }
-      if (ties > 1) {
-        int64_t bestModel = INT64_MIN;
-        for (int k = 0; k < rootCount; k++) {
-          if (worstOf[k] != bestWorst) {
-            continue;
-          }
-          int x = roots[k].second;
-          setOpen(b, x, false);
-          bfsDistance(b, b.trialDist);
-          int step = -1;
-          for (int m : b.neigh[cat]) {
-            if (m >= 0 && b.open[m] && (step < 0 || b.trialDist[m] < b.trialDist[step])) {
-              step = m;
-            }
-          }
-          int64_t modelValue = step < 0 ? INT64_MAX : catcherValue(b, step, 1, INT64_MAX);
-          setOpen(b, x, true);
-          if (modelValue > bestModel) {
-            bestModel = modelValue;
-            best = x;
-          }
-        }
-      }
-    }
+  bool trapping = false;
+  int best = searchBlock(b, cat, false, rootWorst, trapping);
+  if (trapping) {
+    return toPoint(best);
   }
 
   // the runner rejects a block on a blocked cell, the cat's cell or off the board
