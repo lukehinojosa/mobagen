@@ -24,6 +24,8 @@
 //  5. Once the chosen block leaves the cat no finite two-distance (it can't force an escape), switch to the
 //     block within 2 steps of the cat, among those that also leave it none, that traps a plain two-distance
 //     cat soonest in a playout where the catcher blocks the cat's best next cell.
+//  6. Before that, take the block within 2 steps whose playout traps that cat sooner, if the lookahead of
+//     step 3 rates its worst case as good as the chosen block's.
 // Blocking next to the cat (instead of walling the edge) caught last year's cats about 3 times faster.
 //
 // Speed: a block only reruns the pass it can change (two-distance or BFS distance), BFS distance is only
@@ -40,6 +42,7 @@ namespace {
   constexpr int kModelRadius = 2;        // model playouts try the open cells this many steps from the cat
   constexpr int kModelMoves = 40;        // cat moves a model playout runs at most
   constexpr int kModelEscape = 1 << 20;  // a model playout's length when the cat gets out
+  constexpr int kSafetyChecks = 3;       // early model picks checked against the root's worst case
 
   // cells within kModelRadius steps of the cat
   constexpr int kModelCells = 1 + 3 * kModelRadius * (kModelRadius + 1);
@@ -659,26 +662,9 @@ namespace {
     return e.open == 0 || e.bestScore == kInf;
   }
 
-  // the block to play instead of `best`: among blocks within kModelRadius steps of the cat that keep it from
-  // forcing an escape, the one whose playout traps the model cat soonest (`best` wins ties)
-  int modelBlock(Buffers& b, int cat, int best) {
-    // blocking only raises two-distances, so if every escape is already shut any block keeps it shut, and a
-    // block outside the cells the cat's neighbors' two-distances are built from can't shut an open one; the
-    // pass only runs for the rest. b.score is still this board's two-distance.
-    bool allShut = true;
-    for (int n : b.neigh[cat]) {
-      if (b.open[n] && b.score[n] != kInf) {
-        allShut = false;
-      }
-    }
-    if (!allShut) {
-      markSupport(b, cat, b.score, b.inScore);
-      if (!b.inScore[best] || !keepsCatIn(b, cat, best)) {
-        return best;
-      }
-    }
-    // the cells within kModelRadius steps, nearest first (19 for a radius of 2)
-    int cells[kModelCells];
+  // The cells within kModelRadius steps of the cat, nearest first, the cat's own cell at 0 (19 for a radius
+  // of 2); returns how many
+  int cellsNear(const Buffers& b, int cat, int* cells) {
     int steps[kModelCells];
     int count = 0;
     cells[count] = cat;
@@ -706,6 +692,83 @@ namespace {
         }
       }
     }
+    return count;
+  }
+
+  // the worst case after blocking x, by the same search as the root lookahead, is at least `need`
+  bool worstAtLeast(Buffers& b, int cat, int x, int64_t need) {
+    setOpen(b, x, false);
+    std::array<std::pair<int, int>, 6> replies;
+    int count = 0;
+    bool ok = false;
+    if (catReplies(b, cat, replies, count)) {
+      ok = true;
+      for (int r = 0; r < count && ok; r++) {
+        if (catcherValue(b, replies[r].second, kSearchDepth, need) < need) {
+          ok = false;
+        }
+      }
+    }
+    setOpen(b, x, true);
+    return ok;
+  }
+
+  // before the escape is shut: the blocks within kModelRadius steps whose playouts trap the model cat sooner
+  // than `best`'s, shortest first, and the first of up to kSafetyChecks whose worst case is as good as
+  // `best`'s (rootWorst).
+  int earlyBlock(Buffers& b, int cat, int best, int64_t rootWorst) {
+    if (rootWorst == INT64_MIN) {
+      return best;
+    }
+    int cells[kModelCells];
+    const int count = cellsNear(b, cat, cells);
+    setOpen(b, best, false);
+    const int bestLen = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, INT_MAX);
+    setOpen(b, best, true);
+    std::array<std::pair<int, int>, kModelCells> better;
+    int betterCount = 0;
+    for (int k = 1; k < count; k++) {
+      const int x = cells[k];
+      if (x == best || !b.open[x]) {
+        continue;
+      }
+      setOpen(b, x, false);
+      const int len = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, bestLen);
+      setOpen(b, x, true);
+      if (len < bestLen) {
+        better[betterCount++] = {len, x};
+      }
+    }
+    std::stable_sort(better.begin(), better.begin() + betterCount);
+    for (int k = 0; k < betterCount && k < kSafetyChecks; k++) {
+      if (worstAtLeast(b, cat, better[k].second, rootWorst)) {
+        return better[k].second;
+      }
+    }
+    return best;
+  }
+
+  // the block to play instead of `best`: once the escape is shut, among blocks within kModelRadius steps of
+  // the cat that keep it shut, the one whose playout traps the model cat soonest (`best` wins ties); before
+  // that, earlyBlock
+  int modelBlock(Buffers& b, int cat, int best, int64_t rootWorst) {
+    // blocking only raises two-distances, so if every escape is already shut any block keeps it shut, and a
+    // block outside the cells the cat's neighbors' two-distances are built from can't shut an open one; the
+    // pass only runs for the rest. b.score is still this board's two-distance.
+    bool allShut = true;
+    for (int n : b.neigh[cat]) {
+      if (b.open[n] && b.score[n] != kInf) {
+        allShut = false;
+      }
+    }
+    if (!allShut) {
+      markSupport(b, cat, b.score, b.inScore);
+      if (!b.inScore[best] || !keepsCatIn(b, cat, best)) {
+        return earlyBlock(b, cat, best, rootWorst);
+      }
+    }
+    int cells[kModelCells];
+    const int count = cellsNear(b, cat, cells);
     // decided before the playouts, which reuse inScore
     bool keeps[kModelCells];
     for (int k = 1; k < count; k++) {
@@ -823,6 +886,7 @@ Point2D Catcher::Move(CatWorld* world) {
   }
 
   // lookahead on the best few blocks, unless one of them already traps the cat
+  int64_t rootWorst = INT64_MIN;  // the chosen block's worst case, for modelBlock
   if (bestValue != INT64_MAX) {
     std::stable_sort(b.rootValues.begin(), b.rootValues.end(), [](const auto& a, const auto& c) { return a.first > c.first; });
     const auto roots = b.rootValues;
@@ -850,6 +914,8 @@ Point2D Catcher::Move(CatWorld* world) {
         best = x;
       }
     }
+
+    rootWorst = bestWorst;
 
     // cat model tie-break: among blocks with the same worst case, the one that does best against a cat
     // that follows its shortest path (the generatePath cat)
@@ -895,6 +961,6 @@ Point2D Catcher::Move(CatWorld* world) {
   if (best < 0) {
     return {catPos.x == h ? catPos.x - 1 : catPos.x + 1, catPos.y};  // nothing legal is left
   }
-  best = modelBlock(b, cat, best);
+  best = modelBlock(b, cat, best, rootWorst);
   return toPoint(best);
 }
