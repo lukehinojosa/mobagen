@@ -23,12 +23,16 @@
 //  4. Once the cat can no longer reach the border, stop defending and shrink its region: block the cell
 //     that leaves the cat the least room.
 //  5. Once the chosen block leaves the cat no finite two-distance (it can't force an escape), switch to the
-//     block within 3 steps of the cat, among those that also leave it none, that traps a plain two-distance
-//     cat soonest in a playout. The playout catcher is steps 1, 2 and 4 without the lookahead, trying only
-//     blocks within 2 steps of the cat.
+//     block within 3 steps of the cat, among those that also leave it none, that traps a model cat soonest
+//     in a playout. The playout catcher is steps 1, 2 and 4 without the lookahead, trying only blocks
+//     within 2 steps of the cat.
 //  6. Before that, take the block within 3 steps whose playout traps that cat sooner, if the lookahead of
 //     step 3 rates its worst case at most one two-distance step below the chosen block's (up to 3 tried,
 //     shortest playout first).
+//  7. The model cat is a plain two-distance cat, unless the cat's last 5 steps, rebuilt from the board, fit
+//     a cat that walks its shortest path to the nearest edge (the generatePath cat) and don't fit a
+//     two-distance cat (ranked like AaronArchambault's: two-distance, BFS distance, more shortest paths,
+//     more room). Then it is that path cat, which a catcher that knows its route traps far sooner.
 // Blocking next to the cat (instead of walling the edge) caught last year's cats about 3 times faster.
 //
 // Speed: a block only reruns the pass it can change (two-distance or BFS distance), BFS distance is only
@@ -51,6 +55,9 @@ namespace {
   constexpr int kModelEscape = 1 << 20;    // a model playout's length when the cat gets out
   constexpr int kSafetyChecks = 3;         // early model picks checked against the root's worst case
   constexpr int64_t kScoreStep = 8000000;  // one two-distance step in a value (see valueOf)
+  constexpr int kHistorySteps = 5;         // cat steps rebuilt to tell which model cat fits
+  constexpr int kHistoryBudget = 400;      // positions each model may try while rebuilding them
+  constexpr int kHistoryBlocks = 18;       // cells near an earlier cat cell where its next block may have been
 
   // cells within kModelRadius steps of the cat
   constexpr int kModelCells = 1 + 3 * kModelRadius * (kModelRadius + 1);
@@ -75,6 +82,8 @@ namespace {
     std::vector<Escape> rootEscape;
     std::vector<int> rootBestScore;
     std::vector<std::pair<int64_t, int>> rootValues;
+    std::vector<int> parent;    // the path cat's search
+    std::vector<double> paths;  // shortest paths to the border from each cell (nodeDist's board)
   };
 
   Buffers& buffersFor(int side) {
@@ -87,9 +96,10 @@ namespace {
     for (auto* v : {&b.cand, &b.inScore, &b.inDist}) {
       v->assign(total + 1, 0);
     }
-    for (auto* v : {&b.score, &b.dist, &b.trialScore, &b.trialDist, &b.nodeScore, &b.nodeDist, &b.rootBestScore}) {
+    for (auto* v : {&b.score, &b.dist, &b.trialScore, &b.trialDist, &b.nodeScore, &b.nodeDist, &b.rootBestScore, &b.parent}) {
       v->resize(total + 1);
     }
+    b.paths.resize(total + 1);
     b.rootEscape.resize(total);
     return b;
   }
@@ -593,8 +603,11 @@ namespace {
     return best;
   }
 
-  // the model cat's move: a border cell if it can reach one, else its best next cell; -1 when it is trapped
-  int modelCatMove(Buffers& b, int cat) {
+  enum Model { kTwoDistanceCat, kPathCat };
+
+  // the two-distance cat's move: a border cell if it can reach one, else its best next cell; -1 when it is
+  // trapped
+  int twoDistanceCatMove(Buffers& b, int cat) {
     twoDistance(b, b.nodeScore);
     bfsDistance(b, b.nodeDist);
     for (int n : b.neigh[cat]) {
@@ -605,9 +618,50 @@ namespace {
     return bestNextCell(b, cat);
   }
 
+  // the path cat's move (the generatePath cat): BFS from the cat in neighbor order, stopping at the first
+  // border cell found, and the first step of that path. With no border reachable, its first open neighbor;
+  // -1 when it is trapped.
+  int pathCatMove(Buffers& b, int cat) {
+    const int total = b.side * b.side;
+    std::fill(b.parent.begin(), b.parent.end(), -1);
+    b.parent[total] = total;  // the sentinel counts as seen
+    b.parent[cat] = cat;
+    int tail = 0;
+    b.queue[tail++] = cat;
+    int exit = -1;
+    for (int head = 0; head < tail && exit < 0; head++) {
+      const int c = b.queue[head];
+      for (int m : b.neigh[c]) {
+        if (b.parent[m] >= 0 || !b.open[m]) {
+          continue;
+        }
+        b.parent[m] = c;
+        if (b.isBorder[m]) {
+          exit = m;
+          break;
+        }
+        b.queue[tail++] = m;
+      }
+    }
+    if (exit < 0) {
+      for (int n : b.neigh[cat]) {
+        if (b.open[n]) {
+          return n;
+        }
+      }
+      return -1;
+    }
+    while (b.parent[exit] != cat) {
+      exit = b.parent[exit];
+    }
+    return exit;
+  }
+
+  int modelCatMove(Buffers& b, int cat, Model model) { return model == kPathCat ? pathCatMove(b, cat) : twoDistanceCatMove(b, cat); }
+
   // Runs until the model cat is trapped (cat to move on `cat`); kModelEscape if it gets out. Stops at
   // `cutoff` once the playout can no longer end sooner than that, since the caller only keeps a shorter one.
-  int playout(Buffers& b, int cat, int cutoff) {
+  int playout(Buffers& b, int cat, int cutoff, Model model) {
     int placed[kModelMoves];
     int count = 0;
     int plies = 0;
@@ -617,7 +671,7 @@ namespace {
         result = cutoff;
         break;
       }
-      const int m = modelCatMove(b, cat);
+      const int m = modelCatMove(b, cat, model);
       if (m < 0) {
         result = plies;
         break;
@@ -696,6 +750,134 @@ namespace {
     return count;
   }
 
+  // Which model cat? (step 7)
+
+  // nodeScore, nodeDist and the shortest path counts for the board as it is
+  void historyPasses(Buffers& b) {
+    twoDistance(b, b.nodeScore);
+    bfsDistance(b, b.nodeDist);
+    std::fill(b.paths.begin(), b.paths.end(), 0.0);
+    int tail = 0;
+    for (int i : b.borders) {
+      if (b.open[i]) {
+        b.paths[i] = 1.0;
+        b.queue[tail++] = i;
+      }
+    }
+    for (int head = 0; head < tail; head++) {
+      const int c = b.queue[head];
+      for (int n : b.neigh[c]) {
+        if (b.open[n] && b.nodeDist[n] == b.nodeDist[c] + 1) {
+          if (b.paths[n] == 0.0) {
+            b.queue[tail++] = n;
+          }
+          b.paths[n] += b.paths[c];
+        }
+      }
+    }
+  }
+
+  // open cells within 2 steps of p (counted once per route through a neighbor), not counting `from`
+  int roomAround(const Buffers& b, int p, int from) {
+    int count = 0;
+    for (int a : b.neigh[p]) {
+      if (!b.open[a] || a == from) {
+        continue;
+      }
+      count++;
+      for (int c : b.neigh[a]) {
+        if (b.open[c] && c != from && c != p) {
+          count++;
+        }
+      }
+    }
+    return count;
+  }
+
+  // does the model cat on `from` step to `to`? (historyPasses must hold this board's passes for the
+  // two-distance cat, ranked here like AaronArchambault's)
+  bool stepsTo(Buffers& b, Model model, int from, int to) {
+    if (model == kPathCat) {
+      return pathCatMove(b, from) == to;
+    }
+    int first = -1;
+    for (int n : b.neigh[from]) {
+      if (!b.open[n]) {
+        continue;
+      }
+      if (first < 0) {
+        first = n;
+        continue;
+      }
+      bool better = false;
+      if (b.nodeScore[n] != b.nodeScore[first]) {
+        better = b.nodeScore[n] < b.nodeScore[first];
+      } else if (b.nodeDist[n] != b.nodeDist[first]) {
+        better = b.nodeDist[n] < b.nodeDist[first];
+      } else if (b.paths[n] != b.paths[first]) {
+        better = b.paths[n] > b.paths[first];
+      } else {
+        better = roomAround(b, n, from) > roomAround(b, first, from);
+      }
+      if (better) {
+        first = n;
+      }
+    }
+    return first == to;
+  }
+
+  // Can the model cat explain the cat's last `steps` steps, ending on `cur`? Each earlier step is checked
+  // on this board, as it is or with one blocked cell near the earlier cell open again (the block made while
+  // the cat stood there). Reaching the center (where the cat starts) ends the history; running out of
+  // `budget` counts as explained.
+  bool explains(Buffers& b, Model model, int cur, int steps, int& budget) {
+    if (steps == 0 || --budget < 0) {
+      return true;
+    }
+    if (model == kTwoDistanceCat) {
+      historyPasses(b);
+    }
+    const int total = b.side * b.side;
+    int prev[6];
+    int prevCount = 0;
+    for (int p : b.neigh[cur]) {
+      if (b.open[p] && !b.isBorder[p] && stepsTo(b, model, p, cur)) {
+        prev[prevCount++] = p;
+      }
+    }
+    for (int k = 0; k < prevCount; k++) {
+      const int p = prev[k];
+      if (p == total / 2 || steps == 1 || explains(b, model, p, steps - 1, budget)) {
+        return true;
+      }
+      int cells[kModelCells];
+      const int count = cellsNear(b, p, cells);
+      for (int j = 1; j < count && j <= kHistoryBlocks; j++) {
+        const int x = cells[j];
+        if (b.open[x]) {
+          continue;
+        }
+        setOpen(b, x, true);
+        const bool fits = explains(b, model, p, steps - 1, budget);
+        setOpen(b, x, false);
+        if (fits) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // the path cat if only it explains the cat's last kHistorySteps steps, else the two-distance cat
+  Model modelFor(Buffers& b, int cat) {
+    int budget = kHistoryBudget;
+    if (!explains(b, kPathCat, cat, kHistorySteps, budget)) {
+      return kTwoDistanceCat;
+    }
+    budget = kHistoryBudget;
+    return explains(b, kTwoDistanceCat, cat, kHistorySteps, budget) ? kTwoDistanceCat : kPathCat;
+  }
+
   // the worst case after blocking x, by the same search as the root lookahead, is at least `need`
   bool worstAtLeast(Buffers& b, int cat, int x, int64_t need) {
     setOpen(b, x, false);
@@ -723,10 +905,11 @@ namespace {
       return best;
     }
     const int64_t need = (rootWorst / kScoreStep - 1) * kScoreStep;  // one two-distance step below
+    const Model model = modelFor(b, cat);
     int cells[kModelCells];
     const int count = cellsNear(b, cat, cells);
     setOpen(b, best, false);
-    const int bestLen = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, INT_MAX);
+    const int bestLen = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, INT_MAX, model);
     setOpen(b, best, true);
     std::array<std::pair<int, int>, kModelCells> better;
     int betterCount = 0;
@@ -736,7 +919,7 @@ namespace {
         continue;
       }
       setOpen(b, x, false);
-      const int len = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, bestLen);
+      const int len = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, bestLen, model);
       setOpen(b, x, true);
       if (len < bestLen) {
         better[betterCount++] = {len, x};
@@ -778,8 +961,9 @@ namespace {
       const int x = cells[k];
       keeps[k] = x != best && b.open[x] && (allShut || (b.inScore[x] && keepsCatIn(b, cat, x)));
     }
+    const Model model = modelFor(b, cat);
     setOpen(b, best, false);
-    int pickLen = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, INT_MAX);
+    int pickLen = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, INT_MAX, model);
     setOpen(b, best, true);
     int pick = best;
     for (int k = 1; k < count; k++) {
@@ -788,7 +972,7 @@ namespace {
         continue;
       }
       setOpen(b, x, false);
-      const int len = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, pickLen);
+      const int len = openAround(b, cat, -1) == 0 ? 0 : playout(b, cat, pickLen, model);
       setOpen(b, x, true);
       if (len < pickLen) {
         pickLen = len;
