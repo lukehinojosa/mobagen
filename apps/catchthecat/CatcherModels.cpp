@@ -572,12 +572,16 @@ namespace {
 //    (reachable from them by strictly decreasing value; his passes run through the cat's cell), and only from
 //    the neighbors tied for the best two-distance unless the block raises it; and it only reruns that pass;
 //  - a block on a neighbor's shortest paths removes (paths from the neighbor to it) * (its paths to the border)
-//    of them, so the BFS pass only runs when it removes them all;
-//  - only his 10 best first-look blocks are ever used, so the rest never get the BFS pass; a follow-up search
-//    only needs its best score, so only blocks tied for the best two-distance get it;
+//    of them, so the BFS pass only runs when it removes them all, and then only when that neighbor was the
+//    closest (it can only get farther) and the score could still matter to the caller;
+//  - only his 10 best first-look blocks are ever used, so the rest never get the BFS pass and only those 10 are
+//    kept in order; a follow-up search only needs its best score, so only blocks tied for the best two-distance
+//    get it;
 //  - a lookahead block stops once it can't beat the best block's worst case, and its second reply's search
 //    once it can't lower the first's.
-// Over 45,000 turns against every cat in the harness it played his block every time, about 6 times faster.
+// Over 45,000 turns against every cat in the harness it played his block every time. Timed against his code on
+// the same 8,610 positions (same block on every one): about 12 times faster in ordinary games, and 18 times
+// faster where the cat is held, where the survival playouts below spend their time.
 namespace {
   namespace aaron {
     constexpr int kUnreachable = 1 << 29;
@@ -634,9 +638,10 @@ namespace {
       std::vector<double> trialPaths;
       std::vector<int> count, queue, mark, steps, scoreDist;
       std::vector<double> scorePaths;
-      std::vector<uint8_t> inTwo, inDist, inTwoMin, inDistMin, isNb, inRegion;
-      std::vector<double> via;  // 6 per cell: shortest paths from each neighbor of the scored position
-      int baseMin = 0;          // the scored position's best two-distance
+      std::vector<uint8_t> inTwo, inDist, inTwoMin, inDistMin, isNb, nearPos, inRegion;
+      std::vector<double> via;                   // 6 per cell: shortest paths from each neighbor of the scored position
+      uint8_t viaReady[6] = {0, 0, 0, 0, 0, 0};  // which via tables the last markSupport has built so far
+      int baseMin = 0;                           // the scored position's best two-distance
       int stamp = 0;
       std::vector<Trial> trials, followTrials;
       std::vector<Ranked> ranked;
@@ -668,7 +673,7 @@ namespace {
       for (auto* v : {&m.dist, &m.two, &m.trialDist, &m.trialTwo, &m.count, &m.queue, &m.mark, &m.steps, &m.scoreDist}) {
         v->assign(m.cells, 0);
       }
-      for (auto* v : {&m.blocked, &m.inTwo, &m.inDist, &m.inTwoMin, &m.inDistMin, &m.isNb, &m.inRegion}) {
+      for (auto* v : {&m.blocked, &m.inTwo, &m.inDist, &m.inTwoMin, &m.inDistMin, &m.isNb, &m.nearPos, &m.inRegion}) {
         v->assign(m.cells, 0);
       }
       m.paths.assign(m.cells, 0.0);
@@ -858,8 +863,8 @@ namespace {
     // the cells whose block can change the two-distance / BFS distance and path count at pos's neighbors (from
     // this board's passes): the open cells reachable from them by strictly decreasing value. inTwo / inDist
     // start from every open neighbor, inTwoMin / inDistMin only from those with the best two-distance (the only
-    // ones that decide the score while it stays the best, since blocks only raise values). Also the shortest
-    // path counts from each neighbor (via), for the path-count shortcut.
+    // ones that decide the score while it stays the best, since blocks only raise values). The shortest path
+    // counts from each neighbor (via, for the path-count shortcut) are left for ensureVia.
     void markSupport(Model& m, int pos) {
       int* q = m.queue.data();
       const int* neigh = m.neigh.data();
@@ -894,29 +899,7 @@ namespace {
         }
       }
       for (int k = 0; k < 6; k++) {
-        double* via = m.via.data() + k * m.cells;
-        std::fill(via, via + m.cells, 0.0);
-        const int n = around[k];
-        if (n < 0 || m.blocked[n] || m.dist[n] >= kUnreachable) {
-          continue;
-        }
-        via[n] = 1.0;
-        int tail = 0;
-        q[tail++] = n;
-        for (int head = 0; head < tail; head++) {
-          const int c = q[head];
-          const int* next = neigh + c * 6;
-          for (int j = 0; j < 6; j++) {
-            const int x = next[j];
-            if (x < 0 || m.blocked[x] || m.dist[x] != m.dist[c] - 1) {
-              continue;
-            }
-            if (via[x] == 0.0) {
-              q[tail++] = x;
-            }
-            via[x] += via[c];
-          }
-        }
+        m.viaReady[k] = 0;  // built on first use (ensureVia)
       }
     }
 
@@ -938,20 +921,162 @@ namespace {
       m.blocked[t.cell] = 0;
     }
 
-    // the full score of blocking t.cell with the cat on pos (m.dist / m.paths hold the board without it)
-    Score trialScore(Model& m, int pos, const Trial& t) {
-      m.blocked[t.cell] = 1;
+    // Most blocks are neither in the support of pos's best neighbors' two-distances nor one of pos's neighbors,
+    // so their trial is the board's own values: startTrials makes that one trial (and marks pos's neighbors),
+    // trialOne copies it for those blocks, endTrials clears the marks. markSupport must have run for pos.
+    Trial startTrials(Model& m, int pos) {
+      Trial base;
+      base.cell = -1;
+      const int* around = m.neigh.data() + pos * 6;
+      for (int k = 0; k < 6; k++) {
+        base.two[k] = around[k] >= 0 ? m.two[around[k]] : 0;
+        if (around[k] >= 0) {
+          m.nearPos[around[k]] = 1;
+        }
+      }
+      base.twoDist = m.baseMin;
+      return base;
+    }
+
+    void trialOne(Model& m, int pos, const Trial& base, int c, Trial& t) {
+      if (m.nearPos[c] || (m.inTwoMin[c] && m.baseMin < kUnreachable)) {
+        t.cell = c;
+        trialTwo(m, pos, t);
+      } else {
+        t = base;
+        t.cell = c;
+      }
+    }
+
+    void endTrials(Model& m, int pos) {
+      const int* around = m.neigh.data() + pos * 6;
+      for (int k = 0; k < 6; k++) {
+        if (around[k] >= 0) {
+          m.nearPos[around[k]] = 0;
+        }
+      }
+    }
+
+    // the shortest paths from pos's k-th neighbor to every cell, for the path-count shortcut: built the first time
+    // they are needed after markSupport(pos), on its board
+    void ensureVia(Model& m, int pos, int k) {
+      if (m.viaReady[k]) {
+        return;
+      }
+      m.viaReady[k] = 1;
+      int* q = m.queue.data();
+      const int* neigh = m.neigh.data();
+      double* via = m.via.data() + k * m.cells;
+      std::fill(via, via + m.cells, 0.0);
+      const int n = neigh[pos * 6 + k];
+      if (n < 0 || m.blocked[n] || m.dist[n] >= kUnreachable) {
+        return;
+      }
+      via[n] = 1.0;
+      int tail = 0;
+      q[tail++] = n;
+      for (int head = 0; head < tail; head++) {
+        const int c = q[head];
+        const int* next = neigh + c * 6;
+        for (int j = 0; j < 6; j++) {
+          const int x = next[j];
+          if (x < 0 || m.blocked[x] || m.dist[x] != m.dist[c] - 1) {
+            continue;
+          }
+          if (via[x] == 0.0) {
+            q[tail++] = x;
+          }
+          via[x] += via[c];
+        }
+      }
+    }
+
+    // a block that raised the best two-distance brings in other neighbors, so their support counts too
+    bool inSupport(const Model& m, const Trial& t) { return t.twoDist != m.baseMin ? m.inDist[t.cell] : m.inDistMin[t.cell]; }
+
+    // the shortest paths from the neighbors of pos whose path counts t.cell's block can change (before blocking it)
+    void viaForTrial(Model& m, int pos, const Trial& t) {
+      if (!inSupport(m, t)) {
+        return;
+      }
+      const int* around = m.neigh.data() + pos * 6;
+      for (int k = 0; k < 6; k++) {
+        const int n = around[k];
+        if (n >= 0 && n != t.cell && !m.blocked[n] && t.two[k] == t.twoDist) {
+          ensureVia(m, pos, k);
+        }
+      }
+    }
+
+    // the score of blocking t.cell with the cat on pos (m.dist / m.paths hold the board without it) when it
+    // needs no pass, or false. With `floor`, the caller only uses a score that beats it, so a score that can't
+    // may come back as a bound.
+    bool quickScore(Model& m, int pos, const Trial& t, const Score* floor, Score& out) {
+      const int* dist = m.dist.data();
+      const double* paths = m.paths.data();
+      const int* around = m.neigh.data() + pos * 6;
+      if (dist[pos] == kUnreachable) {
+        return false;  // pos is sealed in: the region size counts
+      }
+      const bool support = inSupport(m, t);
+      viaForTrial(m, pos, t);
+      // Most blocks need no pass: the tied neighbors (best two-distance) only lose the paths through the block,
+      // and a neighbor that loses all of them (a cut) can only get farther, at least one step. So the reply is
+      // the best of the others whenever one of them is no farther than every cut neighbor was; only a cut of the
+      // closest neighbors needs the pass. A blocked neighbor just drops out (its trial two-distances already
+      // leave it out).
+      Score reply = kCaught;
+      int cutDist = kUnreachable + 1;  // the closest cut neighbor's distance before the block
+      for (int k = 0; k < 6; k++) {
+        const int n = around[k];
+        if (n < 0 || n == t.cell || m.blocked[n]) {
+          continue;
+        }
+        double p = paths[n];
+        if (support && t.two[k] == t.twoDist) {
+          const double through = m.via[k * m.cells + t.cell] * paths[t.cell];
+          p = paths[n] - through;
+          if (through > 0.0 && p <= 0.0) {
+            cutDist = std::min(cutDist, dist[n]);
+            continue;
+          }
+        }
+        const Score s{t.two[k], dist[n], p, 0};
+        if (reply.beats(s)) {
+          reply = s;
+        }
+      }
+      if (cutDist > kUnreachable || (reply.twoDist == t.twoDist && reply.dist <= cutDist)) {
+        out = reply;
+        return true;
+      }
+      // the cut neighbors can only lower the reply below the others' best: if that can't beat the floor,
+      // neither can the true score
+      if (floor && reply.twoDist == t.twoDist && !reply.beats(*floor)) {
+        out = reply;
+        return true;
+      }
+      return false;
+    }
+
+    // the score of blocking t.cell with the cat on pos, with the pass where it needs one
+    Score trialScore(Model& m, int pos, const Trial& t, const Score* floor) {
+      Score quick;
+      if (quickScore(m, pos, t, floor, quick)) {
+        return quick;
+      }
       const int* dist = m.dist.data();
       const double* paths = m.paths.data();
       const int* around = m.neigh.data() + pos * 6;
       bool sealed = dist[pos] == kUnreachable;
+      viaForTrial(m, pos, t);
+      m.blocked[t.cell] = 1;
       for (int k = 0; k < 6; k++) {
         if (around[k] >= 0) {
           m.steps[around[k]] = t.two[k];
         }
       }
-      // a block that raised the best two-distance brings in other neighbors, so their support counts too
-      if (t.twoDist != m.baseMin ? m.inDist[t.cell] : m.inDistMin[t.cell]) {
+      if (inSupport(m, t)) {
         // only the neighbors with the best two-distance decide the score; their path counts drop by the paths
         // through the block, and only a block through all of one's paths needs the pass
         int wanted = 0;
@@ -1043,19 +1168,21 @@ namespace {
       const int count = followUpCells(m, pos, rankedCount, cells);
       int trialCount = 0;
       int top = INT_MIN;
+      const Trial baseTrial = startTrials(m, pos);
       for (int i = 0; i < count; i++) {
         const int c = cells[i];
         if (m.blocked[c] || c == pos) {
           continue;
         }
         Trial& t = m.followTrials[trialCount++];
-        t.cell = c;
-        trialTwo(m, pos, t);
+        trialOne(m, pos, baseTrial, c, t);
         if (cap && t.twoDist > cap->twoDist) {
+          endTrials(m, pos);
           return Score{t.twoDist, 0, 0.0, 0};
         }
         top = std::max(top, t.twoDist);
       }
+      endTrials(m, pos);
       // only blocks tied for the best two-distance can give the best score
       Score best = kEscaped;
       const Score base = scoreFrom(m, pos, m.two.data(), m.dist.data(), m.paths.data(), sealed);
@@ -1064,7 +1191,7 @@ namespace {
         if (t.twoDist != top) {
           continue;
         }
-        const Score s = (sealed || m.inTwoMin[t.cell] || m.inDistMin[t.cell]) ? trialScore(m, pos, t) : base;
+        const Score s = (sealed || m.inTwoMin[t.cell] || m.inDistMin[t.cell]) ? trialScore(m, pos, t, &best) : base;
         if (s.beats(best)) {
           best = s;
         }
@@ -1179,15 +1306,15 @@ namespace {
       // first look: every open cell's two-distance, then full scores only for those that can make the top 10
       twoDistance(m, m.two, -1);
       markSupport(m, cat);
+      const Trial baseTrial = startTrials(m, cat);
       int trialCount = 0;
       for (int c = 0; c < m.cells; c++) {
         if (c == cat || m.blocked[c]) {
           continue;
         }
-        Trial& t = m.trials[trialCount++];
-        t.cell = c;
-        trialTwo(m, cat, t);
+        trialOne(m, cat, baseTrial, c, m.trials[trialCount++]);
       }
+      endTrials(m, cat);
       if (trialCount == 0) {
         return cat == 0 ? 1 : 0;  // his fallback: the first cell that isn't the cat's
       }
@@ -1199,16 +1326,27 @@ namespace {
         std::nth_element(m.twos.begin(), m.twos.begin() + (kTopFollowUps - 1), m.twos.begin() + trialCount, std::greater<int>());
         cut = m.twos[kTopFollowUps - 1];
       }
+      // his stable sort, but only its top 10 are ever used: keep them in order as the blocks come (a block
+      // only goes ahead of those it beats, so ties stay in board order). A block below the cut can't make it.
       const Score base = scoreFrom(m, cat, m.two.data(), m.dist.data(), m.paths.data(), m.dist[cat] == kUnreachable);
+      int rankedCount = 0;
       for (int i = 0; i < trialCount; i++) {
         const Trial& t = m.trials[i];
-        Score s{t.twoDist, 0, 0.0, 0};  // below the top 10: only its rank below them matters
-        if (t.twoDist >= cut) {
-          s = (m.inTwoMin[t.cell] || m.inDistMin[t.cell]) ? trialScore(m, cat, t) : base;
+        if (t.twoDist < cut) {
+          continue;
         }
-        m.ranked[i] = {s, t.cell};
+        const Score* floor = rankedCount == kTopFollowUps ? &m.ranked[kTopFollowUps - 1].score : nullptr;
+        const Score s = (m.inTwoMin[t.cell] || m.inDistMin[t.cell]) ? trialScore(m, cat, t, floor) : base;
+        if (rankedCount == kTopFollowUps && !s.beats(m.ranked[kTopFollowUps - 1].score)) {
+          continue;
+        }
+        int at = rankedCount < kTopFollowUps ? rankedCount++ : kTopFollowUps - 1;
+        while (at > 0 && s.beats(m.ranked[at - 1].score)) {
+          m.ranked[at] = m.ranked[at - 1];
+          at--;
+        }
+        m.ranked[at] = {s, t.cell};
       }
-      std::stable_sort(m.ranked.begin(), m.ranked.begin() + trialCount, [](const Ranked& a, const Ranked& c) { return a.score.beats(c.score); });
       if (m.ranked[0].score.twoDist == kCaught.twoDist) {
         return m.ranked[0].cell;
       }
@@ -1217,10 +1355,10 @@ namespace {
       int best = m.ranked[0].cell;
       Score bestWorst = kEscaped;
       bool found = false;
-      for (int k = 0; k < kTopBlocks && k < trialCount; k++) {
+      for (int k = 0; k < kTopBlocks && k < rankedCount; k++) {
         const int x = m.ranked[k].cell;
         m.blocked[x] = 1;
-        const Score worst = worstCase(m, cat, trialCount, found, bestWorst);
+        const Score worst = worstCase(m, cat, rankedCount, found, bestWorst);
         m.blocked[x] = 0;
         if (!found || worst.beats(bestWorst)) {
           best = x;
