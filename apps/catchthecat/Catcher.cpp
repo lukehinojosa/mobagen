@@ -29,10 +29,11 @@
 //  6. Before that, take the block within 3 steps whose playout traps that cat sooner, if the lookahead of
 //     step 3 rates its worst case at most one two-distance step below the chosen block's (up to 3 tried,
 //     shortest playout first).
-//  7. The model cat is a plain two-distance cat, unless the cat's last 5 steps, rebuilt from the board, fit
-//     a cat that walks its shortest path to the nearest edge (the generatePath cat) and don't fit a
-//     two-distance cat (ranked like AaronArchambault's: two-distance, BFS distance, more shortest paths,
-//     more room). Then it is that path cat, which a catcher that knows its route traps far sooner.
+//  7. The model cat is a plain two-distance cat, unless the cat's last 5 steps, rebuilt from the board, don't
+//     fit a two-distance cat (ranked like AaronArchambault's: two-distance, BFS distance, more shortest
+//     paths, more room) but do fit one of these: a cat that walks its shortest path to the nearest edge (the
+//     generatePath cat), which a catcher that knows its route traps far sooner; else a lookahead cat, which
+//     weighs each step against the catcher's worst wall next.
 // Blocking next to the cat (instead of walling the edge) caught last year's cats about 3 times faster.
 //
 // Speed: a block only reruns the pass it can change (two-distance or BFS distance), BFS distance is only
@@ -82,8 +83,10 @@ namespace {
     std::vector<Escape> rootEscape;
     std::vector<int> rootBestScore;
     std::vector<std::pair<int64_t, int>> rootValues;
-    std::vector<int> parent;    // the path cat's search
-    std::vector<double> paths;  // shortest paths to the border from each cell (nodeDist's board)
+    std::vector<int> parent;                           // the path cat's search
+    std::vector<double> paths;                         // shortest paths to the border from each cell (nodeDist's board)
+    std::vector<int> lookScore, lookDist;              // the lookahead cat: the board's passes before any wall
+    std::vector<uint8_t> lookScoreFrom, lookDistFrom;  // and the cells a step's best values are built from
   };
 
   Buffers& buffersFor(int side) {
@@ -93,10 +96,11 @@ namespace {
     }
     grid::setSide(b, side);
     const int total = b.total;
-    for (auto* v : {&b.cand, &b.inScore, &b.inDist}) {
+    for (auto* v : {&b.cand, &b.inScore, &b.inDist, &b.lookScoreFrom, &b.lookDistFrom}) {
       v->assign(total + 1, 0);
     }
-    for (auto* v : {&b.score, &b.dist, &b.trialScore, &b.trialDist, &b.nodeScore, &b.nodeDist, &b.rootBestScore, &b.parent}) {
+    for (auto* v :
+         {&b.score, &b.dist, &b.trialScore, &b.trialDist, &b.nodeScore, &b.nodeDist, &b.rootBestScore, &b.parent, &b.lookScore, &b.lookDist}) {
       v->resize(total + 1);
     }
     b.paths.resize(total + 1);
@@ -603,7 +607,7 @@ namespace {
     return best;
   }
 
-  enum Model { kTwoDistanceCat, kPathCat };
+  enum Model { kTwoDistanceCat, kPathCat, kLookaheadCat };
 
   // the two-distance cat's move: a border cell if it can reach one, else its best next cell; -1 when it is
   // trapped
@@ -657,7 +661,148 @@ namespace {
     return exit;
   }
 
-  int modelCatMove(Buffers& b, int cat, Model model) { return model == kPathCat ? pathCatMove(b, cat) : twoDistanceCatMove(b, cat); }
+  // The lookahead cat: a cat that looks one move ahead (its step, then the catcher's worst wall). An edge
+  // step at once; else each step s in neighbor order, against the catcher's worst wall within 2 steps of s
+  // (through open cells; sealed in: next to s), scored at s's open neighbors as
+  // -100 * min(two-distance, 50) - BFS distance (sealed in: -100000 + room). The first best step wins.
+  // Modeled on LogiBear's cat (Logi-Bear/mobagen 08f3acb) at the search depth it finishes on most moves on
+  // the competition machine.
+  constexpr int kLookaheadUnreachable = 1000000;
+
+  // a step's score with the cat on s, from these passes (a wall, if any, already in place)
+  int lookaheadValue(Buffers& b, int s, const std::vector<int>& score, const std::vector<int>& dist) {
+    int bestScore = kLookaheadUnreachable, bestDist = kLookaheadUnreachable;
+    bool canMove = false;
+    for (int n : b.neigh[s]) {
+      if (!b.open[n]) {
+        continue;
+      }
+      canMove = true;
+      bestScore = std::min(bestScore, score[n] >= kBlocked ? kLookaheadUnreachable : score[n]);
+      bestDist = std::min(bestDist, dist[n] >= kBlocked ? kLookaheadUnreachable : dist[n]);
+    }
+    if (!canMove) {
+      return -1000000 + 2;  // trapped
+    }
+    if (bestDist == kLookaheadUnreachable) {
+      return -100000 + regionSize(b, s, -1);
+    }
+    return -100 * std::min(bestScore, 50) - bestDist;
+  }
+
+  // the cells s's open neighbors with value `target` are built from (reachable by strictly decreasing `v`)
+  void markBuiltFrom(Buffers& b, int s, const std::vector<int>& v, int target, std::vector<uint8_t>& mark) {
+    std::fill(mark.begin(), mark.end(), 0);
+    int tail = 0;
+    for (int n : b.neigh[s]) {
+      if (b.open[n] && v[n] == target && !mark[n]) {
+        mark[n] = 1;
+        b.queue[tail++] = n;
+      }
+    }
+    for (int head = 0; head < tail; head++) {
+      const int c = b.queue[head];
+      for (int m : b.neigh[c]) {
+        if (b.open[m] && !mark[m] && v[m] < v[c]) {
+          mark[m] = 1;
+          b.queue[tail++] = m;
+        }
+      }
+    }
+  }
+
+  // Walls only lower a step's score, so a step whose score without one can't beat the best so far is
+  // skipped, and a wall outside the cells its best neighbors' values are built from leaves it unchanged. A
+  // wall only reruns the pass it can change.
+  int lookaheadCatMove(Buffers& b, int cat) {
+    for (int n : b.neigh[cat]) {
+      if (b.open[n] && b.isBorder[n]) {
+        return n;
+      }
+    }
+    twoDistance(b, b.lookScore);
+    bfsDistance(b, b.lookDist);
+    int best = -1, bestValue = INT_MIN;
+    for (int s : b.neigh[cat]) {
+      if (!b.open[s]) {
+        continue;
+      }
+      const int base = lookaheadValue(b, s, b.lookScore, b.lookDist);
+      if (base <= bestValue) {
+        continue;
+      }
+      const bool sealed = b.lookDist[s] >= kBlocked;
+      int walls[18];
+      int wallCount = 0;
+      for (int n : b.neigh[s]) {
+        if (b.open[n]) {
+          walls[wallCount++] = n;
+        }
+      }
+      if (!sealed) {
+        const int ring = wallCount;
+        for (int i = 0; i < ring; i++) {
+          for (int m : b.neigh[walls[i]]) {
+            if (!b.open[m] || m == s) {
+              continue;
+            }
+            bool seen = false;
+            for (int j = 0; j < wallCount; j++) {
+              seen = seen || walls[j] == m;
+            }
+            if (!seen) {
+              walls[wallCount++] = m;
+            }
+          }
+        }
+      }
+      // the two-distance only counts below 50
+      int bestScore = kLookaheadUnreachable, bestDist = kLookaheadUnreachable;
+      for (int n : b.neigh[s]) {
+        if (b.open[n]) {
+          bestScore = std::min(bestScore, b.lookScore[n] >= kBlocked ? kLookaheadUnreachable : b.lookScore[n]);
+          bestDist = std::min(bestDist, b.lookDist[n] >= kBlocked ? kLookaheadUnreachable : b.lookDist[n]);
+        }
+      }
+      const bool scoreCounts = bestScore < 50 && !sealed;
+      if (scoreCounts) {
+        markBuiltFrom(b, s, b.lookScore, bestScore, b.lookScoreFrom);
+      }
+      if (!sealed) {
+        markBuiltFrom(b, s, b.lookDist, bestDist, b.lookDistFrom);
+      }
+      int worst = base;
+      for (int i = 0; i < wallCount && worst > bestValue; i++) {
+        const int w = walls[i];
+        const bool changesScore = scoreCounts && b.lookScoreFrom[w];
+        const bool changesDist = !sealed && b.lookDistFrom[w];
+        if (!sealed && !changesScore && !changesDist) {
+          continue;
+        }
+        setOpen(b, w, false);
+        if (changesScore) {
+          twoDistance(b, b.nodeScore);
+        }
+        if (changesDist) {
+          bfsDistance(b, b.nodeDist);
+        }
+        worst = std::min(worst, lookaheadValue(b, s, changesScore ? b.nodeScore : b.lookScore, changesDist ? b.nodeDist : b.lookDist));
+        setOpen(b, w, true);
+      }
+      if (worst > bestValue) {
+        bestValue = worst;
+        best = s;
+      }
+    }
+    return best;
+  }
+
+  int modelCatMove(Buffers& b, int cat, Model model) {
+    if (model == kPathCat) {
+      return pathCatMove(b, cat);
+    }
+    return model == kLookaheadCat ? lookaheadCatMove(b, cat) : twoDistanceCatMove(b, cat);
+  }
 
   // Runs until the model cat is trapped (cat to move on `cat`); kModelEscape if it gets out. Stops at
   // `cutoff` once the playout can no longer end sooner than that, since the caller only keeps a shorter one.
@@ -800,6 +945,9 @@ namespace {
     if (model == kPathCat) {
       return pathCatMove(b, from) == to;
     }
+    if (model == kLookaheadCat) {
+      return lookaheadCatMove(b, from) == to;
+    }
     int first = -1;
     for (int n : b.neigh[from]) {
       if (!b.open[n]) {
@@ -868,14 +1016,16 @@ namespace {
     return false;
   }
 
-  // the path cat if only it explains the cat's last kHistorySteps steps, else the two-distance cat
+  // the first model of the two-distance cat, the path cat and the lookahead cat that explains the cat's last
+  // kHistorySteps steps, or the two-distance cat if none does
   Model modelFor(Buffers& b, int cat) {
-    int budget = kHistoryBudget;
-    if (!explains(b, kPathCat, cat, kHistorySteps, budget)) {
-      return kTwoDistanceCat;
+    for (Model model : {kTwoDistanceCat, kPathCat, kLookaheadCat}) {
+      int budget = kHistoryBudget;
+      if (explains(b, model, cat, kHistorySteps, budget)) {
+        return model;
+      }
     }
-    budget = kHistoryBudget;
-    return explains(b, kTwoDistanceCat, cat, kHistorySteps, budget) ? kTwoDistanceCat : kPathCat;
+    return kTwoDistanceCat;
   }
 
   // the worst case after blocking x, by the same search as the root lookahead, is at least `need`
