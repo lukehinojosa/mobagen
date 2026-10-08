@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
@@ -16,7 +17,7 @@
 //  2. Model search: catchers that defend the edge (instead of blocking next to the cat) beat plain
 //     two-distance by plugging each exit as the cat laps the board. When the board shows such a style,
 //     search up to 6 cat moves for a line that beats cheap copies of those catchers, and take it. On the
-//     leaderboard, when an exact copy of JordanCoolbeth's catcher explains the last two blocks, plan against
+//     leaderboard, when an exact copy of JordanCoolbeth's catcher explains the last three blocks, plan against
 //     it alone.
 //  3. Veto: try the catcher replies that can matter to the top move (cells its score depends on). Only if
 //     one of them cuts off every escape, switch to the move whose worst reply leaves the cat best off.
@@ -37,6 +38,18 @@
 //     8 moves deep; and a catcher that blocks one of the border cells nearest the cat, tie broken its own way.
 //     Most of last year's other edge catchers play like this; the search then goes for the move with the best
 //     chance of escaping within 8 moves, with each nearest exit taken as equally likely.
+//  8. Against AaronArchambault's or LogiBear's catcher (arena only): the cat recognizes the catcher when an exact
+//     copy made its blocks (AaronArchambault's, step 6's copy: every block this game; LogiBear's at depth 3 or 1: 2
+//     of his last 3 blocks and 60% of them all, as his clock sometimes goes deeper). The copy's replies are certain,
+//     so the cat searches for a line that escapes them (planning against LogiBear at the depth his last block came
+//     from; up to 700 ms from the start of the move, the search tree kept from move to move), plays it out while
+//     the replies match, and until it has one steps toward the most promising position.
+//  9. On the leaderboard (no memory), against LogiBear's catcher: the board shows it when his catcher at depth 1 (the
+//     depth he mostly reaches on the runner's machine) would have made the last 2 blocks, asked only once the block
+//     count (the board starts with at most a tenth of its cells blocked) or the cat's distance from the center shows
+//     he has made 2; not when step 2's copy of JordanCoolbeth's catcher explains his last three, nor when
+//     AaronArchambault's would have made the last one too. Then a fresh search like step 8's (up to 600 ms from the
+//     start of the move) plays the first step of a line that wins against it.
 // All buffers are flat arrays reused across calls, so nothing is allocated after the first move.
 
 namespace {
@@ -50,6 +63,10 @@ namespace {
   constexpr int kMaxReplies = 8;
 
   constexpr int kSurvivalTwo = 14;  // best two-distance from which the survival playouts take over (step 6)
+  constexpr int kEscapeMs = 700;
+  constexpr int kLogiWindow = 3;       // step 8: LogiBear's catcher must explain all but one of his last this many blocks
+  constexpr int kLogiShareTenths = 6;  // and this many tenths of all his blocks
+  constexpr int kLeaderEscapeMs = 600;
 
   // the shared board (Grid.h: neighbor table, open cells, distance passes) and the cat's own arrays, each
   // with the sentinel entry at index side * side
@@ -207,6 +224,54 @@ namespace {
     return models::confirmed(memory.hits);
   }
 
+  // step 8: the cell the escape search picks against AaronArchambault's or LogiBear's catcher, or -1. Only while
+  // every block this game is the copy's (the arena's memory has at least one; on the leaderboard it has none)
+  int escapeLine(const Buffers& b, int cat, std::chrono::steady_clock::time_point start) {
+    if (memory.hits.empty()) {
+      return -1;
+    }
+    bool aaron = true;
+    for (int h : memory.hits) {
+      aaron = aaron && (h & models::aaronBit());
+    }
+    const int n = static_cast<int>(memory.hits.size()), recent = std::min(n, kLogiWindow);
+    int matched = 0, matchedRecent = 0;
+    for (int k = 0; k < n; k++) {
+      const bool hit = (memory.hits[k] & (models::logi3Bit() | models::logi1Bit())) != 0;
+      matched += hit;
+      matchedRecent += hit && k >= n - recent;
+    }
+    const bool logi = matchedRecent >= std::min(recent, kLogiWindow - 1) && matched * 10 >= n * kLogiShareTenths;
+    if (!aaron && !logi) {
+      return -1;
+    }
+    // his clock decides his depth: plan against the one his last block came from (depth 3 if both or neither)
+    const int last = memory.hits.back();
+    const int from = aaron                                                         ? models::kEscapeAaron
+                     : (last & models::logi1Bit()) && !(last & models::logi3Bit()) ? models::kEscapeLogi1
+                                                                                   : models::kEscapeLogi3;
+    return models::escapeMove(b, cat, from, start + std::chrono::milliseconds(kEscapeMs), true);
+  }
+
+  // step 9 (leaderboard): against LogiBear's catcher, the first step of a line that wins against his catcher at depth
+  // 1, or -1. Not once the cat is held: step 6's playouts against AaronArchambault's catcher take over there
+  int leaderboardEscape(Buffers& b, int cat, std::chrono::steady_clock::time_point start) {
+    int bestTwo = kInf;
+    for (int n : b.neigh[cat]) {
+      if (n >= 0 && b.open[n]) {
+        bestTwo = std::min(bestTwo, b.score[n]);
+      }
+    }
+    if (bestTwo >= kSurvivalTwo) {
+      return -1;
+    }
+    const auto deadline = start + std::chrono::milliseconds(kLeaderEscapeMs);
+    if (!models::logiOnBoard(b, cat, deadline)) {
+      return -1;
+    }
+    return models::escapeMove(b, cat, models::kEscapeLogi1, deadline, false);
+  }
+
   // keeps the board the cat's move was made on (usualMove left it loaded) for the next call's playedLike
   Point2D remember(int side, Point2D move) {
     const auto& b = buffersFor(side);
@@ -217,6 +282,7 @@ namespace {
 
   // the cat's move before the survival playouts (strategy steps 1 to 5)
   Point2D usualMove(CatWorld* world) {
+    const auto start = std::chrono::steady_clock::now();
     const int side = world->getWorldSideSize();
     const int half = side / 2;
     const auto& state = world->worldState();
@@ -230,6 +296,16 @@ namespace {
     const Point2D cat = world->getCat();
     const int catIdx = (cat.y + half) * side + cat.x + half;
     const int seen = playedLike(b, catIdx);
+    const int line = escapeLine(b, catIdx, start);
+    if (line >= 0) {
+      return {line % side - half, line / side - half};
+    }
+    if (Cat::movesThisProcess == 1) {
+      const int lb = leaderboardEscape(b, catIdx, start);
+      if (lb >= 0) {
+        return {lb % side - half, lb / side - half};
+      }
+    }
     std::array<std::pair<std::array<int, 5>, int>, 6> moves;
     int moveCount = 0;
     for (int n : b.neigh[catIdx]) {

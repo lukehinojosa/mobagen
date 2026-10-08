@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <queue>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -19,7 +20,8 @@ namespace {
   constexpr int kModelBudget = 20000;    // search nodes per move
   constexpr int kEdgeSharePercent = 30;  // general edge models run when this share of blocks is on the border
   constexpr int kPortSignature = 6;      // extra blocks on a student's pattern before trusting their port
-  constexpr int kJordanBlocks = 2;       // last blocks the JordanCoolbeth port must explain
+  constexpr int kJordanBlocks = 3;       // last blocks the JordanCoolbeth port must explain (2 also let step 9's
+                                         // LogiBear check stand down against LogiBear; the same against Jordan)
   constexpr int kNearestDepth = 8;       // cat moves searched against kNearestExits (6 and 10 won fewer games)
   constexpr int kNearestBudget = 60000;  // search nodes per move against it
   constexpr int kMaxExits = 32;          // nearest exits kNearestExits chooses from
@@ -27,6 +29,7 @@ namespace {
   constexpr int kPortBudget = 30000;
   constexpr int kConfirmBlocks = 3;  // last blocks the arena cat's memory needs a model to predict (2 to 5 did as well)
   constexpr int kPortConfirmBlocks = 6;
+  constexpr int kLogiFitBlocks = 2;  // last blocks LogiBear's catcher at depth 1 must explain on the leaderboard
 
   // Model search. Each model predicts the catcher's block for a given cat cell; the search looks for a
   // line of cat moves that reaches the border against that prediction.
@@ -41,6 +44,9 @@ namespace {
     kNearestExits,     // block one of the border cells nearest the cat, which one unknown (arena cat's memory only)
     kAylwin,           // exact port of last year's AylwinMorgan catcher (arena cat's memory only)
     kCosmey,           // exact port of last year's Cosmey catcher (arena cat's memory only)
+    kAaron,            // AaronArchambault's catcher (aaron::move): only for the arena cat's escape search
+    kLogi3,            // LogiBear's catcher at depth 3 (logi::bestWall): only for the arena cat's escape search
+    kLogi1,            // ... at depth 1 (his clock decides how deep he gets; the arena cat accepts either)
     kModelCount
   };
 
@@ -672,13 +678,609 @@ namespace {
     }
   }  // namespace cosmey
 
-  // JordanCoolbeth's catcher (dewdrop-ripple/GPR-340-mobagen e0c007a) while the cat can reach the border:
-  // his generatePath finds the first border cell a BFS from the cat reaches (neighbors in his order NE, NW,
-  // SE, SW, E, W). Next to the cat, he blocks it; otherwise he walks the border from it, a step clockwise
-  // then a step counterclockwise, and blocks the first open cell. -1 once no border is reachable (he then
-  // boxes the cat in).
+  // LogiBear's catcher (Logi-Bear/mobagen 02ebce1) at a fixed depth: the same wall as his code (harness
+  // var_logiPort.cpp, students26/LogiBear-02e). His search runs on a 40 ms clock, on the viewer's machine in the
+  // arena (like ours: at native speed it finished depth 1 on 29% of moves, 3 on 55%, 5 or more on 17%) and on the
+  // runner's machine on the leaderboard (a quarter of that speed: depth 1 on 77%, 3 on 15%). Since 02ebce1 he plays
+  // the first of his 12 best walls (by score, ties in search order) that leaves the cat no forced escape within 3
+  // moves. Those scores are alpha-beta bounds that depend on the search's order, so his search is kept exactly as
+  // it is (the root's order and iterative deepening, the inner orders, the windows); underneath:
+  //  - flat arrays and no allocation in the passes;
+  //  - a root wall's shortest-escape pass is shared by the cat steps after it;
+  //  - a leaf's distance terms are its inner node's unless its wall is in the downhill support of every best
+  //    neighbor; passes from the edge stop once the first of the cat's open neighbors is settled;
+  //  - leaf scores are cached by (cat, the walls added since the root, as a set).
+  namespace logi {
+    constexpr int kNotReachable = 1000000;
+    constexpr int kEscaped = 1000000;
+    constexpr int kTrapped = -1000000;
+    constexpr int kSealedIn = -100000;
+    constexpr int kImaginedWallRadius = 2;
+    constexpr int kFirstWallRadius = 5;
+    constexpr int kFirstWallRadiusSealed = 3;
+    constexpr int kEscapeRouteRadius = 5;
+    constexpr int kNearbyExitWeight = 50;
+    constexpr int kExitLookahead = 2;
+    constexpr int kFarExitWeight = 5;
+    constexpr int kFarExitLookahead = 5;
+    constexpr int kLadderCheckRange = 2;
+    constexpr int kLadderMaxSteps = 12;
+    constexpr int kContainmentWeight = 100;
+    constexpr int kContainmentRadius = 3;
+    constexpr int kSafetyCheckMoves = 3;   // his final check: no forced escape within this many cat moves
+    constexpr int kSafetyCheckWalls = 12;  // ... tried on this many of the search's best walls
+
+    struct Board {
+      int side = 0, cells = 0, cat = 0;
+      std::vector<uint8_t> walls, edge;
+      std::vector<int> edgeList;
+      std::vector<std::array<int, 6>> neigh;  // CatWorld::neighbors order, -1 off the board
+      // scratch
+      std::vector<int> steps, times, queue;
+      std::vector<int> stepsCat, queueCat;
+
+      void setSide(int s) {
+        if (side == s) {
+          return;
+        }
+        side = s;
+        cells = s * s;
+        const int h = s / 2;
+        walls.assign(cells, 0);
+        edge.assign(cells, 0);
+        edgeList.clear();
+        neigh.assign(cells, {});
+        for (int i = 0; i < cells; i++) {
+          const Point2D p = {i % s - h, i / s - h};
+          edge[i] = std::abs(p.x) == h || std::abs(p.y) == h;
+          if (edge[i]) {
+            edgeList.push_back(i);
+          }
+          const auto around = CatWorld::neighbors(p);
+          for (int k = 0; k < 6; k++) {
+            neigh[i][k] = std::abs(around[k].x) <= h && std::abs(around[k].y) <= h ? (around[k].y + h) * s + around[k].x + h : -1;
+          }
+        }
+        for (auto* v : {&steps, &times, &queue, &stepsCat, &queueCat}) {
+          v->assign(cells, 0);
+        }
+      }
+      bool isOpen(int c) const { return c >= 0 && !walls[c]; }
+    };
+
+    // his stepsFrom(openEdgeCells(), needed) into `out`; with `stopAt` >= 0, stops once a neighbor of stopAt that is
+    // open gets its steps (returns that value; kNotReachable if none does). Values left unset are kNotReachable.
+    int edgePass(Board& b, std::vector<int>& out, int needed, int stopAt) {
+      std::fill(out.begin(), out.end(), kNotReachable);
+      std::fill(b.times.begin(), b.times.end(), 0);
+      int tail = 0;
+      for (int e : b.edgeList) {
+        if (!b.walls[e]) {
+          out[e] = 0;
+          b.queue[tail++] = e;
+        }
+      }
+      if (stopAt >= 0) {
+        for (int n : b.neigh[stopAt]) {
+          if (b.isOpen(n) && out[n] == 0) {
+            return 0;
+          }
+        }
+      }
+      for (int head = 0; head < tail; head++) {
+        const int c = b.queue[head];
+        for (int n : b.neigh[c]) {
+          if (!b.isOpen(n) || out[n] != kNotReachable) {
+            continue;
+          }
+          if (++b.times[n] < needed) {
+            continue;
+          }
+          out[n] = out[c] + 1;
+          b.queue[tail++] = n;
+          if (stopAt >= 0) {
+            for (int q : b.neigh[stopAt]) {
+              if (q == n) {
+                return out[n];
+              }
+            }
+          }
+        }
+      }
+      return kNotReachable;
+    }
+
+    // his stepsFrom({cat}, 1, maxSteps) into b.stepsCat; returns how many cells it reached
+    int catPass(Board& b, int from, int maxSteps) {
+      std::fill(b.stepsCat.begin(), b.stepsCat.end(), kNotReachable);
+      int tail = 0;
+      b.stepsCat[from] = 0;
+      b.queueCat[tail++] = from;
+      for (int head = 0; head < tail; head++) {
+        const int c = b.queueCat[head];
+        if (b.stepsCat[c] >= maxSteps) {
+          continue;
+        }
+        for (int n : b.neigh[c]) {
+          if (!b.isOpen(n) || b.stepsCat[n] != kNotReachable) {
+            continue;
+          }
+          b.stepsCat[n] = b.stepsCat[c] + 1;
+          b.queueCat[tail++] = n;
+        }
+      }
+      return tail;
+    }
+
+    struct Search {
+      Board& b;
+      std::vector<int> shortestRootWall;  // the shortest pass for the board after the root wall (shared by cat steps)
+      std::vector<int> leafShort, leafTwo;
+      std::unordered_map<uint64_t, int> leafCache;
+      int rootWall = -1, innerWall = -1;  // the walls added since the root, for the cache key
+      // his catCanForceEscape (cat to move): can the cat reach the edge within `movesLeft` of its moves whatever
+      // the catcher walls? A yes or no that any search order finds, so it is his whichever way it is computed
+      bool catCanForceEscape(int movesLeft) {
+        if (movesLeft <= 0) {
+          return false;
+        }
+        const int cat = b.cat;
+        for (int n : b.neigh[cat]) {
+          if (b.isOpen(n) && b.edge[n]) {
+            return true;
+          }
+        }
+        if (movesLeft == 1) {
+          return false;
+        }
+        std::vector<int> toEdge(b.cells);
+        edgePass(b, toEdge, 1, -1);
+        for (int n : b.neigh[cat]) {
+          if (!b.isOpen(n) || toEdge[n] > movesLeft - 1) {
+            continue;
+          }
+          b.cat = n;
+          const bool escapes = catcherCannotStopEscape(movesLeft - 1);
+          b.cat = cat;
+          if (escapes) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      // his catcherCannotStopEscape (catcher to move): does every wall on a short enough escape route still leave
+      // the cat a forced escape?
+      bool catcherCannotStopEscape(int movesLeft) {
+        const int cat = b.cat;
+        catPass(b, cat, movesLeft);
+        const std::vector<int> fromCat = b.stepsCat;
+        std::vector<int> toEdge(b.cells);
+        edgePass(b, toEdge, 1, -1);
+        for (int c = 0; c < b.cells; c++) {
+          if (c == cat || b.walls[c] || fromCat[c] == kNotReachable || fromCat[c] + toEdge[c] > movesLeft) {
+            continue;
+          }
+          b.walls[c] = 1;
+          const bool still = catCanForceEscape(movesLeft);
+          b.walls[c] = 0;
+          if (!still) {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      // does wall w pass his safety check (no forced escape within kSafetyCheckMoves)?
+      bool wallHolds(int w) {
+        b.walls[w] = 1;
+        const bool holds = !catCanForceEscape(kSafetyCheckMoves);
+        b.walls[w] = 0;
+        return holds;
+      }
+
+      // An inner catcher node's leaves share its board but for their own wall V. A distance value only depends on
+      // the cells reachable from it by strictly decreasing values (its downhill support), so the cat's best value
+      // after V is the node's own unless V is in the support of every neighbor that has it (or is that neighbor).
+      // support[c] has bit k when c is in the support of the k-th such neighbor.
+      int ctxCat = -1, minShort = kNotReachable, minTwo = kNotReachable;
+      int bestShortN[6], bestTwoN[6], nShort = 0, nTwo = 0;
+      std::vector<uint8_t> supShort, supTwo;
+      std::vector<int> baseTwo, downQueue;
+
+      void markDown(const std::vector<int>& value, int from, uint8_t bit, std::vector<uint8_t>& sup) {
+        int tail = 0;
+        downQueue[tail++] = from;
+        sup[from] |= bit;
+        for (int head = 0; head < tail; head++) {
+          const int c = downQueue[head];
+          for (int n : b.neigh[c]) {
+            if (b.isOpen(n) && value[n] < value[c] && !(sup[n] & bit)) {
+              sup[n] |= bit;
+              downQueue[tail++] = n;
+            }
+          }
+        }
+      }
+
+      // the context for leaves with the cat on `cat` (board: the root wall's)
+      void startInner(int cat) {
+        ctxCat = cat;
+        edgePass(b, baseTwo, 2, -1);
+        std::fill(supShort.begin(), supShort.end(), 0);
+        std::fill(supTwo.begin(), supTwo.end(), 0);
+        minShort = minTwo = kNotReachable;
+        nShort = nTwo = 0;
+        for (int n : b.neigh[cat]) {
+          if (b.isOpen(n)) {
+            minShort = std::min(minShort, shortestRootWall[n]);
+            minTwo = std::min(minTwo, baseTwo[n]);
+          }
+        }
+        for (int n : b.neigh[cat]) {
+          if (!b.isOpen(n)) {
+            continue;
+          }
+          if (minShort != kNotReachable && shortestRootWall[n] == minShort) {
+            markDown(shortestRootWall, n, static_cast<uint8_t>(1 << nShort), supShort);
+            bestShortN[nShort++] = n;
+          }
+          if (minTwo != kNotReachable && baseTwo[n] == minTwo) {
+            markDown(baseTwo, n, static_cast<uint8_t>(1 << nTwo), supTwo);
+            bestTwoN[nTwo++] = n;
+          }
+        }
+      }
+
+      // is the node's best value still there after wall v?
+      static bool keeps(const int* best, int count, const std::vector<uint8_t>& sup, int v) {
+        for (int k = 0; k < count; k++) {
+          if (best[k] != v && !(sup[v] & (1 << k))) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      explicit Search(Board& board) : b(board) {
+        shortestRootWall.resize(b.cells);
+        supShort.resize(b.cells);
+        supTwo.resize(b.cells);
+        baseTwo.resize(b.cells);
+        downQueue.resize(b.cells);
+        leafShort.resize(b.cells);
+        leafTwo.resize(b.cells);
+      }
+
+      bool catWinsLadder(int stepsLeft) {
+        if (stepsLeft == 0) {
+          return false;
+        }
+        const int cat = b.cat;
+        for (int step : b.neigh[cat]) {
+          if (!b.isOpen(step)) {
+            continue;
+          }
+          if (b.edge[step]) {
+            return true;
+          }
+          int edges = 0, only = -1;
+          for (int n : b.neigh[step]) {
+            if (b.isOpen(n) && b.edge[n]) {
+              edges++;
+              only = n;
+            }
+          }
+          if (edges >= 2) {
+            return true;
+          }
+          if (edges == 1) {
+            b.cat = step;
+            b.walls[only] = 1;
+            const bool escapes = catWinsLadder(stepsLeft - 1);
+            b.walls[only] = 0;
+            b.cat = cat;
+            if (escapes) {
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+
+      int scorePosition() {
+        const int cat = b.cat;
+        const uint64_t lo = static_cast<uint64_t>(std::min(rootWall, innerWall) + 1), hi = static_cast<uint64_t>(std::max(rootWall, innerWall) + 1);
+        const uint64_t key = (static_cast<uint64_t>(cat) << 40) | (lo << 20) | hi;
+        auto it = leafCache.find(key);
+        if (it != leafCache.end()) {
+          return it->second;
+        }
+        const bool inner = cat == ctxCat && innerWall >= 0;
+        int bestShortest;
+        if (inner && minShort == kNotReachable) {
+          bestShortest = kNotReachable;  // walls only take routes away
+        } else if (inner && keeps(bestShortN, nShort, supShort, innerWall)) {
+          bestShortest = minShort;
+        } else {
+          bestShortest = edgePass(b, leafShort, 1, cat);
+        }
+        int score;
+        if (bestShortest == kNotReachable) {
+          score = kSealedIn + catPass(b, cat, kNotReachable);
+        } else {
+          bool ladder = false;
+          if (bestShortest <= kLadderCheckRange) {
+            ladder = catWinsLadder(kLadderMaxSteps);
+          }
+          if (ladder) {
+            score = kEscaped - 1000;
+          } else {
+            int bestGuaranteed;
+            if (inner && minTwo == kNotReachable) {
+              bestGuaranteed = kNotReachable;
+            } else if (inner && keeps(bestTwoN, nTwo, supTwo, innerWall)) {
+              bestGuaranteed = minTwo;
+            } else {
+              bestGuaranteed = edgePass(b, leafTwo, 2, cat);
+            }
+            score = -100 * std::min(bestGuaranteed, 50) - bestShortest;
+            const int nearSteps = bestShortest + 1 + kExitLookahead, farSteps = bestShortest + 1 + kFarExitLookahead;
+            catPass(b, cat, std::max(farSteps, bestGuaranteed != kNotReachable ? 0 : kContainmentRadius));
+            int nearExits = 0, farExits = 0;
+            for (int e : b.edgeList) {
+              const int s = b.stepsCat[e];
+              nearExits += s <= nearSteps;
+              farExits += s <= farSteps;
+            }
+            score += kNearbyExitWeight * nearExits + kFarExitWeight * farExits;
+            if (bestGuaranteed == kNotReachable) {
+              int open = 0;
+              for (int i = 0; i < b.cells; i++) {
+                open += b.stepsCat[i] <= kContainmentRadius;
+              }
+              score += kContainmentWeight * open;
+            }
+          }
+        }
+        leafCache.emplace(key, score);
+        return score;
+      }
+
+      // his catcherWallChoices on the current board (cat on b.cat); `shortest` is this board's shortest pass
+      void catcherWallChoices(const std::vector<int>& shortest, std::vector<int>& choices) {
+        choices.clear();
+        const int cat = b.cat;
+        catPass(b, cat, std::max(kImaginedWallRadius, kEscapeRouteRadius));
+        if (shortest[cat] == kNotReachable) {
+          for (int n : b.neigh[cat]) {
+            if (b.isOpen(n)) {
+              choices.push_back(n);
+            }
+          }
+          return;
+        }
+        for (int c = 0; c < b.cells; c++) {
+          if (c == cat || b.walls[c]) {
+            continue;
+          }
+          const int s = b.stepsCat[c];
+          const bool nearCat = s <= kImaginedWallRadius;
+          const bool onRoute = s <= kEscapeRouteRadius && s + shortest[c] <= shortest[cat] + 1;
+          if (nearCat || onRoute) {
+            choices.push_back(c);
+          }
+        }
+        std::stable_sort(choices.begin(), choices.end(), [&](int x, int y) { return b.stepsCat[x] < b.stepsCat[y]; });
+      }
+
+      int searchCatTurn(int depthLeft, int alpha, int beta, int movesPlayed);
+
+      int searchCatcherTurn(int depthLeft, int alpha, int beta, int movesPlayed) {
+        if (b.edge[b.cat]) {
+          return kEscaped - movesPlayed;
+        }
+        if (depthLeft == 0) {
+          return scorePosition();
+        }
+        // only reached at depth 3 from the root's cat turn: the board is the root wall's
+        std::vector<int> walls;
+        catcherWallChoices(shortestRootWall, walls);
+        if (walls.empty()) {
+          return searchCatTurn(depthLeft - 1, alpha, beta, movesPlayed + 1);
+        }
+        if (depthLeft == 1) {
+          startInner(b.cat);
+        }
+        int worst = kEscaped + 1;
+        for (int wall : walls) {
+          b.walls[wall] = 1;
+          innerWall = wall;
+          worst = std::min(worst, searchCatTurn(depthLeft - 1, alpha, beta, movesPlayed + 1));
+          innerWall = -1;
+          b.walls[wall] = 0;
+          beta = std::min(beta, worst);
+          if (alpha >= beta) {
+            break;
+          }
+        }
+        return worst;
+      }
+    };
+
+    int Search::searchCatTurn(int depthLeft, int alpha, int beta, int movesPlayed) {
+      const int cat = b.cat;
+      if (b.edge[cat]) {
+        return kEscaped - movesPlayed;
+      }
+      bool anyOpen = false;
+      for (int n : b.neigh[cat]) {
+        anyOpen = anyOpen || b.isOpen(n);
+      }
+      if (!anyOpen) {
+        return kTrapped + movesPlayed;
+      }
+      if (depthLeft == 0) {
+        return scorePosition();
+      }
+      // his catStepsBestFirst: open neighbors by the shortest pass, stable (only at the root's cat turn: the board is
+      // the root wall's)
+      int steps[6], count = 0;
+      for (int n : b.neigh[cat]) {
+        if (b.isOpen(n)) {
+          steps[count++] = n;
+        }
+      }
+      std::stable_sort(steps, steps + count, [&](int x, int y) { return shortestRootWall[x] < shortestRootWall[y]; });
+      int best = kTrapped - 1;
+      for (int k = 0; k < count; k++) {
+        b.cat = steps[k];
+        best = std::max(best, searchCatcherTurn(depthLeft - 1, alpha, beta, movesPlayed + 1));
+        b.cat = cat;
+        alpha = std::max(alpha, best);
+        if (alpha >= beta) {
+          break;
+        }
+      }
+      return best;
+    }
+
+    // his bestWall at a fixed depth (1 or 3) for the cat on b.cat; -1 if no cell is open
+    // would his catcher at depth 1 wall x (open on b, the cat on b.cat)? At depth 1 his wall is the first in his order
+    // with the lowest score, so x is scored once and the other walls only until one beats it (a wrong x fails
+    // within a few)
+    bool isDepth1Wall(Board& b, int x) {
+      Search s(b);
+      const int cat = b.cat;
+      edgePass(b, s.shortestRootWall, 1, -1);
+      const int radius = s.shortestRootWall[cat] == kNotReachable ? kFirstWallRadiusSealed : kFirstWallRadius;
+      catPass(b, cat, radius);
+      if (x == cat || b.walls[x] || b.stepsCat[x] > radius) {
+        return false;
+      }
+      std::vector<int> walls;
+      for (int c = 0; c < b.cells; c++) {
+        if (c != cat && !b.walls[c] && b.stepsCat[c] <= radius) {
+          walls.push_back(c);
+        }
+      }
+      std::stable_sort(walls.begin(), walls.end(), [&](int p, int q) { return b.stepsCat[p] < b.stepsCat[q]; });
+      // his searchCatTurn at depth 0 after wall w (the cat is never on the edge here)
+      auto value = [&](int w) {
+        b.walls[w] = 1;
+        s.rootWall = w;
+        bool anyOpen = false;
+        for (int n : b.neigh[cat]) {
+          anyOpen = anyOpen || b.isOpen(n);
+        }
+        const int v = anyOpen ? s.scorePosition() : kTrapped + 1;
+        s.rootWall = -1;
+        b.walls[w] = 0;
+        return v;
+      };
+      // his ranking: by score, ties in this order. x is his wall when it holds and every wall ahead of it fails the
+      // check, or when it is his search's best and none of his first kSafetyCheckWalls holds
+      const int vx = value(x);
+      std::vector<std::pair<int, int>> ranking;
+      int ahead = 0;
+      bool seenX = false;
+      for (int w : walls) {
+        if (w == x) {
+          seenX = true;
+          ranking.push_back({vx, w});
+          continue;
+        }
+        const int v = value(w);
+        ranking.push_back({v, w});
+        if (v < vx || (v == vx && !seenX)) {
+          if (++ahead >= kSafetyCheckWalls || s.wallHolds(w)) {
+            return false;  // he tries this one first and it holds, or x is past the walls he tries
+          }
+        }
+      }
+      if (s.wallHolds(x)) {
+        return true;
+      }
+      if (ahead > 0) {
+        return false;
+      }
+      std::stable_sort(ranking.begin(), ranking.end(), [](const auto& p, const auto& q) { return p.first < q.first; });
+      for (int k = 0; k < kSafetyCheckWalls && k < static_cast<int>(ranking.size()); k++) {
+        if (s.wallHolds(ranking[k].second)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    int bestWall(Board& b, int maxDepth) {
+      Search s(b);
+      const int cat = b.cat;
+      edgePass(b, s.shortestRootWall, 1, -1);
+      const bool sealedIn = s.shortestRootWall[cat] == kNotReachable;
+      const int radius = sealedIn ? kFirstWallRadiusSealed : kFirstWallRadius;
+      catPass(b, cat, radius);
+      std::vector<int> walls;
+      for (int c = 0; c < b.cells; c++) {
+        if (c != cat && !b.walls[c] && b.stepsCat[c] <= radius) {
+          walls.push_back(c);
+        }
+      }
+      std::stable_sort(walls.begin(), walls.end(), [&](int x, int y) { return b.stepsCat[x] < b.stepsCat[y]; });
+      if (walls.empty()) {
+        for (int c = 0; c < b.cells; c++) {
+          if (c != cat && !b.walls[c]) {
+            return c;
+          }
+        }
+        return -1;
+      }
+      int bestSoFar = walls[0];
+      std::vector<std::pair<int, int>> ranking;  // (score, wall) of the last pass, in search order
+      for (int depth = 1; depth <= maxDepth; depth += 2) {
+        std::stable_partition(walls.begin(), walls.end(), [&](int w) { return w == bestSoFar; });
+        int bestThisDepth = -1, bestScore = kEscaped + 2, beta = kEscaped + 1;
+        ranking.clear();
+        for (int wall : walls) {
+          b.walls[wall] = 1;
+          s.rootWall = wall;
+          if (depth > 1) {
+            edgePass(b, s.shortestRootWall, 1, -1);
+          }
+          const int score = s.searchCatTurn(depth - 1, kTrapped - 1, beta, 1);
+          s.rootWall = -1;
+          b.walls[wall] = 0;
+          ranking.push_back({score, wall});
+          if (score < bestScore) {
+            bestScore = score;
+            bestThisDepth = wall;
+          }
+          beta = std::min(beta, score);
+        }
+        bestSoFar = bestThisDepth;
+        if (bestScore >= kEscaped - 100 || bestScore <= kTrapped + 100) {
+          break;
+        }
+      }
+      // his safety check (02ebce1): the first of his best walls (by score, ties in search order) that leaves the cat no
+      // forced escape within kSafetyCheckMoves
+      std::stable_sort(ranking.begin(), ranking.end(), [](const auto& p, const auto& q) { return p.first < q.first; });
+      for (int k = 0; k < kSafetyCheckWalls && k < static_cast<int>(ranking.size()); k++) {
+        if (s.wallHolds(ranking[k].second)) {
+          return ranking[k].second;
+        }
+      }
+      return bestSoFar;
+    }
+  }  // namespace logi
+
+  // JordanCoolbeth's catcher (dewdrop-ripple/GPR-340-mobagen a0088c7) while the cat can reach the border:
+  // their generatePath finds the first border cell a BFS from the cat reaches (neighbors in their order NE, NW,
+  // SE, SW, E, W). Within 2 steps of the cat (next to it before a0088c7), they blocks it; otherwise they walk the
+  // border from it, a step clockwise then a step counterclockwise, and blocks the first open cell. -1 once no
+  // border is reachable (theu then boxes the cat in).
   int jordanReply(const grid::Board& b, ModelScratch& s, int cat) {
-    static constexpr int kOrder[6] = {0, 1, 5, 4, 2, 3};  // his order, as CatWorld::neighbors indices
+    static constexpr int kOrder[6] = {0, 1, 5, 4, 2, 3};  // their order, as CatWorld::neighbors indices
     auto& parent = s.modelDist;
     auto& q = s.modelQueue;
     std::fill(parent.begin(), parent.end(), -1);
@@ -703,8 +1305,8 @@ namespace {
     if (exit < 0) {
       return -1;
     }
-    if (parent[exit] == cat) {
-      return exit;  // the cat is next to it
+    if (parent[exit] == cat || parent[parent[exit]] == cat) {
+      return exit;  // within 2 steps of the cat
     }
     const int h = b.side / 2;
     Pt cw{exit % b.side - h, exit / b.side - h}, ccw = cw;
@@ -774,6 +1376,29 @@ namespace {
     return found;
   }
 
+  int aaronReply(const grid::Board& b, int cat);  // after namespace aaron
+
+  int logiReply(const grid::Board& b, int cat, int depth) {
+    static logi::Board lb;
+    lb.setSide(b.side);
+    for (int i = 0; i < b.total; i++) {
+      lb.walls[i] = b.open[i] ? 0 : 1;
+    }
+    lb.cat = cat;
+    return logi::bestWall(lb, depth);
+  }
+
+  // would LogiBear's catcher at depth 1 wall x (open on b) with the cat on `cat`?
+  bool logiIsWall(const grid::Board& b, int cat, int x) {
+    static logi::Board lb;
+    lb.setSide(b.side);
+    for (int i = 0; i < b.total; i++) {
+      lb.walls[i] = b.open[i] ? 0 : 1;
+    }
+    lb.cat = cat;
+    return logi::isDepth1Wall(lb, x);
+  }
+
   // the model's block with the cat standing on `cat`, or -1
   int modelReply(const grid::Board& b, ModelScratch& s, int model, int cat) {
     if (model == kJordan) {
@@ -784,6 +1409,12 @@ namespace {
     }
     if (model == kCosmey) {
       return cosmey::reply(b, s, cat);
+    }
+    if (model == kAaron) {
+      return aaronReply(b, cat);
+    }
+    if (model == kLogi3 || model == kLogi1) {
+      return logiReply(b, cat, model == kLogi3 ? 3 : 1);
     }
     if (model == kAndrew) {
       return andrewReply(b, cat);
@@ -1003,12 +1634,52 @@ namespace {
     return false;
   }
 
+  // could LogiBear's catcher at depth 1 have made the last `blocks` blocks? As jordanFits: the last came with the cat
+  // where it is, so some blocked cell near it (his walls are within 5 steps of the cat) must be his wall there with
+  // that cell open again; the one before came with the cat on a neighbor, with both cells open, and so on.
+  bool logiFits(grid::Board& b, int cat, int blocks, std::chrono::steady_clock::time_point deadline, int* lastWall = nullptr) {
+    const int h = b.side / 2;
+    auto hexDistance = [&](int a, int c) {
+      const int ay = a / b.side - h, cy = c / b.side - h;
+      const int ax = a % b.side - h - (ay - (ay & 1)) / 2, cx = c % b.side - h - (cy - (cy & 1)) / 2;
+      const int dx = ax - cx, dz = ay - cy;
+      return std::max(std::abs(dx), std::max(std::abs(dz), std::abs(dx + dz)));
+    };
+    for (int x = 0; x < b.total; x++) {
+      if (b.open[x] || hexDistance(x, cat) > 5) {
+        continue;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;  // out of time: not recognized
+      }
+      grid::setOpen(b, x, true);
+      bool fits = logiIsWall(b, cat, x);
+      if (fits && blocks > 1) {
+        fits = false;
+        for (int p : b.neigh[cat]) {
+          if (p >= 0 && p < b.total && b.open[p] && !b.isBorder[p] && logiFits(b, p, blocks - 1, deadline)) {
+            fits = true;
+            break;
+          }
+        }
+      }
+      grid::setOpen(b, x, false);
+      if (fits) {
+        if (lastWall) {
+          *lastWall = x;
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
   // does the board look like this model's catcher is playing?
   bool modelFitsBoard(const grid::Board& b, const ModelScratch& s, int model) {
     if (model == kJordan) {
       return false;  // jordanFits decides
     }
-    if (model == kNearestExits || model == kAylwin || model == kCosmey) {
+    if (model == kNearestExits || model == kAylwin || model == kCosmey || model == kAaron || model == kLogi3 || model == kLogi1) {
       return false;  // only the arena cat's memory can tell (see predictedBy)
     }
     if (model == kAndrew) {
@@ -2072,6 +2743,204 @@ namespace {
       return best;
     }
   }  // namespace aaron
+
+  // The arena cat's escape search (models::escapeMove) against a catcher it has an exact copy of: AaronArchambault's
+  // (aaron::move) or LogiBear's (logi::bestWall at depth 3 or 1). The copy's replies are certain, so the only branching
+  // is the cat's. The tree's nodes are positions after the catcher's reply (cat to move); expanding one tries every
+  // cat step against the reply, most promising node first (the cat's best two-distance, then BFS distance; a node
+  // with no reachable border is dead). The tree is kept between moves: after the cat's move and the real reply, the
+  // matching child becomes the root with its subtree (another reply starts a new tree). A cat step onto the border
+  // is a line that wins, played out while the replies match. Without one yet, the cat steps toward the most
+  // promising node, so the tree it built stays in play.
+  namespace escape {
+    struct Node {
+      std::vector<uint8_t> blocked;
+      int cat, parent, block;
+      int64_t key;
+      bool expanded, dead;
+      std::vector<int> children;
+    };
+
+    struct Tree {
+      int from = -1;  // models::kEscapeAaron, kEscapeLogi3 or kEscapeLogi1
+      std::vector<Node> nodes;
+      int root = -1;
+      std::vector<int> line;  // the nodes of a winning line below the root, then winStep
+      int winStep = -1;
+      grid::Board b;
+      std::vector<int> two, dist;
+    };
+    Tree tree;
+
+    int reply(const std::vector<uint8_t>& blocked, int cat) {
+      if (tree.from == models::kEscapeAaron) {
+        aaron::Model& m = aaron::modelFor(tree.b.side);
+        memcpy(m.blocked.data(), blocked.data(), blocked.size());
+        return aaron::move(m, cat);
+      }
+      static logi::Board lb;
+      lb.setSide(tree.b.side);
+      lb.walls = blocked;
+      lb.cat = cat;
+      return logi::bestWall(lb, tree.from == models::kEscapeLogi1 ? 1 : 3);
+    }
+
+    void load(const std::vector<uint8_t>& blocked) {
+      grid::Board& b = tree.b;
+      for (int i = 0; i < b.total; i++) {
+        if (b.open[i] != !blocked[i]) {
+          grid::setOpen(b, i, !blocked[i]);
+        }
+      }
+    }
+
+    // the cat's best (two-distance, BFS distance) with the cat on `cat` to move, INT64_MAX when sealed in
+    int64_t keyOf(const std::vector<uint8_t>& blocked, int cat) {
+      grid::Board& b = tree.b;
+      load(blocked);
+      grid::bfsDistance(b, tree.dist);
+      grid::twoDistance(b, tree.two);
+      int64_t key = INT64_MAX;
+      for (int q : b.neigh[cat]) {
+        if (q >= 0 && q < b.total && b.open[q] && tree.dist[q] != kInf) {
+          key = std::min(key, (int64_t(std::min(tree.two[q], 1 << 20)) << 21) + tree.dist[q]);
+        }
+      }
+      return key;
+    }
+
+    // expands node `at`; returns a winning step (a border cell), -1, or -2 when the deadline came first (the node is
+    // then left as it was)
+    int expand(int at, std::chrono::steady_clock::time_point deadline) {
+      const grid::Board& b = tree.b;
+      const size_t before = tree.nodes.size();
+      const int cat = tree.nodes[at].cat;
+      for (int k = 0; k < 6; k++) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          tree.nodes.resize(before);
+          tree.nodes[at].children.clear();
+          return -2;
+        }
+        const int n = b.neigh[cat][k];
+        if (n < 0 || n >= b.total || tree.nodes[at].blocked[n]) {
+          continue;
+        }
+        if (b.isBorder[n]) {
+          return n;
+        }
+        std::vector<uint8_t> blocked = tree.nodes[at].blocked;
+        const int blk = reply(blocked, n);
+        if (blk < 0 || blk == n || blocked[blk]) {
+          continue;
+        }
+        blocked[blk] = 1;
+        const int64_t key = keyOf(blocked, n);
+        tree.nodes.push_back({std::move(blocked), n, at, blk, key, false, key == INT64_MAX, {}});
+        tree.nodes[at].children.push_back(static_cast<int>(tree.nodes.size()) - 1);
+      }
+      tree.nodes[at].expanded = true;
+      return -1;
+    }
+
+    using Frontier = std::priority_queue<std::pair<int64_t, int>, std::vector<std::pair<int64_t, int>>, std::greater<>>;
+
+    int move(const grid::Board& board, int cat, int from, std::chrono::steady_clock::time_point deadline, bool keepTree) {
+      if (tree.b.side != board.side) {
+        tree.b = board;
+        tree.two.resize(board.total + 1);
+        tree.dist.resize(board.total + 1);
+      }
+      std::vector<uint8_t> blocked(board.total);
+      for (int i = 0; i < board.total; i++) {
+        blocked[i] = board.open[i] ? 0 : 1;
+      }
+      // the root: the child the cat stepped to, if the reply was the copy's
+      int next = -1;
+      if (keepTree && tree.from == from && tree.root >= 0) {
+        for (int c : tree.nodes[tree.root].children) {
+          if (tree.nodes[c].cat == cat && tree.nodes[c].blocked == blocked) {
+            next = c;
+          }
+        }
+      }
+      if (next >= 0) {
+        tree.root = next;
+      } else {
+        tree.from = from;
+        tree.nodes.clear();
+        tree.nodes.push_back({blocked, cat, -1, -1, 0, false, false, {}});
+        tree.root = 0;
+        tree.line.clear();
+      }
+      auto pointTo = [&](int node) { return tree.nodes[node].cat; };
+
+      // a line found earlier
+      if (!tree.line.empty() && tree.line.front() == tree.root) {
+        tree.line.erase(tree.line.begin());
+        return tree.line.empty() ? tree.winStep : pointTo(tree.line.front());
+      }
+
+      Frontier frontier;
+      std::vector<int> stack{tree.root};
+      while (!stack.empty()) {
+        const int x = stack.back();
+        stack.pop_back();
+        const Node& nd = tree.nodes[x];
+        if (nd.dead) {
+          continue;
+        }
+        if (!nd.expanded) {
+          frontier.push({x == tree.root ? INT64_MIN : nd.key, x});
+          continue;
+        }
+        for (int c : nd.children) {
+          stack.push_back(c);
+        }
+      }
+      while (!frontier.empty() && std::chrono::steady_clock::now() < deadline) {
+        const int at = frontier.top().second;
+        frontier.pop();
+        const size_t before = tree.nodes.size();
+        const int win = expand(at, deadline);
+        if (win == -2) {
+          frontier.push({tree.nodes[at].key, at});  // still the most promising
+          break;
+        }
+        if (win >= 0) {
+          std::vector<int> path;
+          for (int x = at; x != tree.root; x = tree.nodes[x].parent) {
+            path.push_back(x);
+          }
+          std::reverse(path.begin(), path.end());
+          tree.line = path;
+          tree.winStep = win;
+          return path.empty() ? win : pointTo(path.front());
+        }
+        for (size_t c = before; c < tree.nodes.size(); c++) {
+          if (!tree.nodes[c].dead) {
+            frontier.push({tree.nodes[c].key, static_cast<int>(c)});
+          }
+        }
+      }
+      // no line yet: toward the most promising node (only with the tree kept for the next move)
+      if (frontier.empty() || !keepTree) {
+        return -1;
+      }
+      int x = frontier.top().second;
+      while (x != tree.root && tree.nodes[x].parent != tree.root) {
+        x = tree.nodes[x].parent;
+      }
+      return x == tree.root ? -1 : pointTo(x);
+    }
+  }  // namespace escape
+
+  int aaronReply(const grid::Board& b, int cat) {
+    aaron::Model& m = aaron::modelFor(b.side);
+    for (int i = 0; i < b.total; i++) {
+      m.blocked[i] = b.open[i] ? 0 : 1;
+    }
+    return aaron::move(m, cat);
+  }
 }  // namespace
 
 namespace models {
@@ -2142,6 +3011,7 @@ namespace models {
       }
       return best;
     }
+    fits[kAaron] = fits[kLogi3] = fits[kLogi1] = false;  // far too slow for this search (the escape search uses them)
     const bool portOnly = fits[kAylwin] || fits[kCosmey];
     const int depth = portOnly ? kPortDepth : kModelDepth;
     int budget = portOnly ? kPortBudget : kModelBudget, best = -1, bestCount = 0;
@@ -2171,4 +3041,44 @@ namespace models {
   }
 
   int survivalMove(const std::vector<bool>& state, int side, int cat, int usual) { return aaron::survivalMove(state, side, cat, usual); }
+
+  int aaronBit() { return 1 << kAaron; }
+
+  int logi3Bit() { return 1 << kLogi3; }
+
+  int logi1Bit() { return 1 << kLogi1; }
+
+  int escapeMove(const grid::Board& b, int cat, int from, std::chrono::steady_clock::time_point deadline, bool keepTree) {
+    return escape::move(b, cat, from, deadline, keepTree);
+  }
+
+  bool logiOnBoard(grid::Board& b, int cat, std::chrono::steady_clock::time_point deadline) {
+    // the board starts with up to a tenth of its cells blocked and the catcher has blocked once per cat move, which
+    // takes the cat at least its distance from the center: so many of the blocks are surely his
+    int blocked = 0;
+    for (int i = 0; i < b.total; i++) {
+      blocked += !b.open[i];
+    }
+    const int h = b.side / 2;
+    const int y = cat / b.side - h, x = cat % b.side - h - (y - (y & 1)) / 2;
+    const int fromCenter = std::max(std::abs(x), std::max(std::abs(y), std::abs(x + y)));
+    const int surelyHis = std::max(blocked - b.total / 10, fromCenter);
+    int last = -1;
+    if (surelyHis < kLogiFitBlocks) {
+      return false;
+    }
+    // JordanCoolbeth's catcher fits: it is theirs
+    if (jordanFits(b, scratchFor(b), cat, kJordanBlocks)) {
+      return false;
+    }
+    if (!logiFits(b, cat, kLogiFitBlocks, deadline, &last)) {
+      return false;
+    }
+    // AaronArchambault's catcher often walls the same cells: when his would have made that last block too, it is
+    // more likely his (and the survival playouts against him are worth more than this search)
+    grid::setOpen(b, last, true);
+    const bool aaron = aaronReply(b, cat) == last;
+    grid::setOpen(b, last, false);
+    return !aaron;
+  }
 }  // namespace models

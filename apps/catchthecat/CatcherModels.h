@@ -2,6 +2,7 @@
 #define CATCHER_MODELS_H
 
 #include "Grid.h"
+#include <chrono>
 #include <vector>
 
 // Models of other students' catchers, for the cat to plan against.
@@ -28,6 +29,28 @@ namespace models {
   // An exact, faster copy of AaronArchambault's catcher (his 2026-10-07 version, 2e882a2): the cat's move on `state`
   // (cat on cell `cat`, true is blocked) whose playout against it lasts longest; `usual` (the cat's own move) breaks ties.
   int survivalMove(const std::vector<bool>& state, int side, int cat, int usual);
+
+  // predictedBy's bits for AaronArchambault's catcher (the copy above) and LogiBear's at depth 3 and at depth 1
+  int aaronBit();
+  int logi3Bit();
+  int logi1Bit();
+
+  // The arena cat's escape search against an exact copy of a catcher (kEscapeAaron: AaronArchambault's; kEscapeLogi3
+  // and kEscapeLogi1: LogiBear's at depth 3 or 1) from `b` with the cat on `cat` to move, until `deadline`: the cell
+  // to step to (the next step of a line that wins against the copy, or toward the most promising position found), or
+  // -1. Keeps its search tree between calls while the catcher's replies are the copy's.
+  constexpr int kEscapeAaron = 0;
+  constexpr int kEscapeLogi3 = 1;
+  constexpr int kEscapeLogi1 = 2;
+  // With `keepTree` false (the leaderboard: a new process every move) the search starts afresh and only returns the
+  // first step of a winning line.
+  int escapeMove(const grid::Board& b, int cat, int from, std::chrono::steady_clock::time_point deadline, bool keepTree);
+
+  // On the leaderboard (no memory): could LogiBear's catcher at depth 1 have made the last 2 blocks? Only asked once
+  // the block count and the cat's distance from the center show he has made at least 2; not when the JordanCoolbeth
+  // port explains the last 3, nor when AaronArchambault's catcher would have made the last block too; false if
+  // `deadline` comes first. Leaves the board as it found it.
+  bool logiOnBoard(grid::Board& b, int cat, std::chrono::steady_clock::time_point deadline);
 }  // namespace models
 
 #endif  // CATCHER_MODELS_H
