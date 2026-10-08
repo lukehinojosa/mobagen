@@ -24,6 +24,10 @@
 //  5. If no border is reachable, survive: move to the neighbor with the most open neighbors.
 //  6. Survival: once the cat's best two-distance is 14 or more (it can hardly force its way out), play each
 //     move out against an exact copy of AaronArchambault's catcher and take the one that lasts longest.
+//     Leaderboard only: it scores a lost game by its length, but in the arena a cat only wins by escaping
+//     (a game at the move cap goes to the catcher), so there the cat keeps running. The leaderboard starts a
+//     new process for every move and the arena keeps the bot loaded for the whole match, so a second Move
+//     call in one process means the arena.
 // All buffers are flat arrays reused across calls, so nothing is allocated after the first move.
 
 namespace {
@@ -273,7 +277,10 @@ namespace {
   }
 }  // namespace
 
+int Cat::movesThisProcess = 0;
+
 Point2D Cat::Move(CatWorld* world) {
+  movesThisProcess++;
   const Point2D usual = usualMove(world);
   const int side = world->getWorldSideSize(), half = side / 2;
   const Point2D cat = world->getCat();
@@ -294,8 +301,8 @@ Point2D Cat::Move(CatWorld* world) {
       bestTwo = std::min(bestTwo, b.score[n]);
     }
   }
-  if (bestTwo < kSurvivalTwo) {
-    return usual;
+  if (bestTwo < kSurvivalTwo || movesThisProcess > 1) {
+    return usual;  // not held yet, or the arena (step 6)
   }
   const int pick = models::survivalMove(world->worldState(), side, (cat.y + half) * side + cat.x + half, (usual.y + half) * side + usual.x + half);
   return {pick % side - half, pick / side - half};
