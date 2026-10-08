@@ -19,6 +19,7 @@ namespace {
   constexpr int kModelBudget = 20000;    // search nodes per move
   constexpr int kEdgeSharePercent = 30;  // general edge models run when this share of blocks is on the border
   constexpr int kPortSignature = 6;      // extra blocks on a student's pattern before trusting their port
+  constexpr int kJordanBlocks = 2;       // last blocks the JordanCoolbeth port must explain
 
   // Model search. Each model predicts the catcher's block for a given cat cell; the search looks for a
   // line of cat moves that reaches the border against that prediction.
@@ -29,6 +30,7 @@ namespace {
     kPlugNearestEdge,  // plug, else the nearest open edge cell
     kAndrew,           // close port of last year's AndrewGenualdo catcher
     kToag,             // close port of last year's TOAG21 catcher
+    kJordan,           // exact port of JordanCoolbeth's catcher (this year's entrant)
     kModelCount
   };
 
@@ -398,8 +400,80 @@ namespace {
     return bd.blocked(out) || out == cat ? -1 : bd.idx(out);
   }
 
+  // JordanCoolbeth's catcher (dewdrop-ripple/GPR-340-mobagen e0c007a) while the cat can reach the border:
+  // his generatePath finds the first border cell a BFS from the cat reaches (neighbors in his order NE, NW,
+  // SE, SW, E, W). Next to the cat, he blocks it; otherwise he walks the border from it, a step clockwise
+  // then a step counterclockwise, and blocks the first open cell. -1 once no border is reachable (he then
+  // boxes the cat in).
+  int jordanReply(const grid::Board& b, ModelScratch& s, int cat) {
+    static constexpr int kOrder[6] = {0, 1, 5, 4, 2, 3};  // his order, as CatWorld::neighbors indices
+    auto& parent = s.modelDist;
+    auto& q = s.modelQueue;
+    std::fill(parent.begin(), parent.end(), -1);
+    parent[cat] = cat;
+    int tail = 0, exit = -1;
+    q[tail++] = cat;
+    for (int head = 0; head < tail && exit < 0; head++) {
+      const int c = q[head];
+      for (int k : kOrder) {
+        const int m = b.neigh[c][k];
+        if (m < 0 || !b.open[m] || parent[m] >= 0) {
+          continue;
+        }
+        parent[m] = c;
+        if (b.isBorder[m]) {
+          exit = m;
+          break;
+        }
+        q[tail++] = m;
+      }
+    }
+    if (exit < 0) {
+      return -1;
+    }
+    if (parent[exit] == cat) {
+      return exit;  // the cat is next to it
+    }
+    const int h = b.side / 2;
+    Pt cw{exit % b.side - h, exit / b.side - h}, ccw = cw;
+    auto openAt = [&](Pt p) {
+      const int i = (p.y + h) * b.side + p.x + h;
+      return i != cat && b.open[i] ? i : -1;
+    };
+    for (int guard = 0; guard < 8 * b.side; guard++) {
+      if (cw.x == -h && cw.y != h) {
+        cw.y++;
+      } else if (cw.y == h && cw.x != h) {
+        cw.x++;
+      } else if (cw.x == h && cw.y != -h) {
+        cw.y--;
+      } else if (cw.y == -h && cw.x != -h) {
+        cw.x--;
+      }
+      if (openAt(cw) >= 0) {
+        return openAt(cw);
+      }
+      if (ccw.x == -h && ccw.y != -h) {
+        ccw.y--;
+      } else if (ccw.y == -h && ccw.x != h) {
+        ccw.x++;
+      } else if (ccw.x == h && ccw.y != h) {
+        ccw.y++;
+      } else if (ccw.y == h && ccw.x != -h) {
+        ccw.x--;
+      }
+      if (openAt(ccw) >= 0) {
+        return openAt(ccw);
+      }
+    }
+    return -1;
+  }
+
   // the model's block with the cat standing on `cat`, or -1
   int modelReply(const grid::Board& b, ModelScratch& s, int model, int cat) {
+    if (model == kJordan) {
+      return jordanReply(b, s, cat);
+    }
     if (model == kAndrew) {
       return andrewReply(b, cat);
     }
@@ -541,8 +615,39 @@ namespace {
     return onWalls - onOther;
   }
 
+  // could JordanCoolbeth's catcher have made the last `blocks` blocks? The last came with the cat on the cell
+  // it is on now: some blocked border cell must be his reply there with that cell open again. The one before
+  // came with the cat on a neighbor, with both cells open, and so on. Last year's edge catchers often fit too
+  // (their blocks near the cat's exit look alike), which is why modelChoice only asks on the leaderboard.
+  bool jordanFits(grid::Board& b, ModelScratch& s, int cat, int blocks) {
+    for (int i : b.borders) {
+      if (b.open[i]) {
+        continue;
+      }
+      grid::setOpen(b, i, true);
+      bool fits = jordanReply(b, s, cat) == i;
+      if (fits && blocks > 1) {
+        fits = false;
+        for (int p : b.neigh[cat]) {
+          if (p >= 0 && b.open[p] && !b.isBorder[p] && jordanFits(b, s, p, blocks - 1)) {
+            fits = true;
+            break;
+          }
+        }
+      }
+      grid::setOpen(b, i, false);
+      if (fits) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // does the board look like this model's catcher is playing?
   bool modelFitsBoard(const grid::Board& b, const ModelScratch& s, int model) {
+    if (model == kJordan) {
+      return false;  // jordanFits decides
+    }
     if (model == kAndrew) {
       return andrewPatternExcess(b) >= kPortSignature;
     }
@@ -1544,11 +1649,17 @@ namespace {
 }  // namespace
 
 namespace models {
-  int modelChoice(grid::Board& b, const int* cells, int count) {
+  int modelChoice(grid::Board& b, int cat, const int* cells, int count, bool tryJordan) {
     auto& s = scratchFor(b);
     bool fits[kModelCount];
     for (int m = 0; m < kModelCount; m++) {
       fits[m] = modelFitsBoard(b, s, m);
+    }
+    // an exact port that explains the last blocks outranks the general styles
+    if (tryJordan && jordanFits(b, s, cat, kJordanBlocks)) {
+      for (int m = 0; m < kModelCount; m++) {
+        fits[m] = m == kJordan;
+      }
     }
     int budget = kModelBudget, best = -1, bestCount = 0;
     for (int i = 0; i < count; i++) {

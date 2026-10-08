@@ -15,7 +15,9 @@
 //     least as close to escaping (over 100,000 games this beat board order on every seed tried).
 //  2. Model search: catchers that defend the edge (instead of blocking next to the cat) beat plain
 //     two-distance by plugging each exit as the cat laps the board. When the board shows such a style,
-//     search up to 6 cat moves for a line that beats cheap copies of those catchers, and take it.
+//     search up to 6 cat moves for a line that beats cheap copies of those catchers, and take it. On the
+//     leaderboard, when an exact copy of JordanCoolbeth's catcher explains the last two blocks, plan against
+//     it alone.
 //  3. Veto: try the catcher replies that can matter to the top move (cells its score depends on). Only if
 //     one of them cuts off every escape, switch to the move whose worst reply leaves the cat best off.
 //     Always trusting the worst case made the cat too timid against last year's real catchers.
@@ -251,7 +253,7 @@ namespace {
         cells[count] = moves[count].second;
         count++;
       }
-      int mv = models::modelChoice(b, cells, count);
+      int mv = models::modelChoice(b, catIdx, cells, count, Cat::movesThisProcess == 1);
       if (mv >= 0) {
         return {mv % side - half, mv / side - half};
       }
