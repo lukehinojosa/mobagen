@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-// Cat strategy (stateless, decided from the current board only):
+// Cat strategy (decided from the current board, plus in the arena a memory of the game):
 //  1. Two-distance: an open border cell scores 0; any other open cell scores 1 + the SECOND smallest
 //     score among its neighbors, because the catcher will block the best one. Rank moves by it. Moves
 //     tied on every ranking key go to the one with the most room: open cells within 2 steps that are at
@@ -30,6 +30,13 @@
 //     (a game at the move cap goes to the catcher), so there the cat keeps running. The leaderboard starts a
 //     new process for every move and the arena keeps the bot loaded for the whole match, so a second Move
 //     call in one process means the arena.
+//  7. Memory (arena only, where the bot stays loaded): the cat keeps the board it moved on, so each call reads
+//     off the catcher's block and checks which models of step 2 predicted it. Models that predicted each of
+//     the last 3 blocks are the only ones the search plans against. More models only memory can confirm: exact
+//     ports of last year's AylwinMorgan and Cosmey catchers (on the last 6 blocks), each planned against alone
+//     8 moves deep; and a catcher that blocks one of the border cells nearest the cat, tie broken its own way.
+//     Most of last year's other edge catchers play like this; the search then goes for the move with the best
+//     chance of escaping within 8 moves, with each nearest exit taken as equally likely.
 // All buffers are flat arrays reused across calls, so nothing is allocated after the first move.
 
 namespace {
@@ -171,6 +178,43 @@ namespace {
     return room;
   }
 
+  // the arena cat's memory of the game (step 7)
+  struct Memory {
+    std::vector<uint8_t> open;  // the board's open cells when the cat last moved
+    int cat = -1;               // the cell it moved to
+    std::vector<int> hits;      // models::predictedBy for each catcher block this game, oldest first
+  };
+  Memory memory;
+
+  // reads the catcher's last block off the board (it is the remembered board plus one block, with the cat where
+  // it moved; anything else is a new game) and returns the models the memory confirms (models::confirmed)
+  int playedLike(Buffers& b, int cat) {
+    int changed = 0, added = -1;
+    // arena only (step 6's check): the first call has nothing to read yet
+    if (Cat::movesThisProcess > 1 && memory.cat == cat && static_cast<int>(memory.open.size()) == b.total) {
+      for (int i = 0; i < b.total; i++) {
+        if (memory.open[i] != b.open[i]) {
+          changed++;
+          added = memory.open[i] ? i : -1;
+        }
+      }
+    }
+    if (changed != 1 || added < 0) {
+      memory.hits.clear();
+      return 0;
+    }
+    memory.hits.push_back(models::predictedBy(b, cat, added));
+    return models::confirmed(memory.hits);
+  }
+
+  // keeps the board the cat's move was made on (usualMove left it loaded) for the next call's playedLike
+  Point2D remember(int side, Point2D move) {
+    const auto& b = buffersFor(side);
+    memory.open.assign(b.open.begin(), b.open.begin() + b.total);
+    memory.cat = (move.y + side / 2) * side + move.x + side / 2;
+    return move;
+  }
+
   // the cat's move before the survival playouts (strategy steps 1 to 5)
   Point2D usualMove(CatWorld* world) {
     const int side = world->getWorldSideSize();
@@ -185,6 +229,7 @@ namespace {
     // stage 1 ranking of the open neighbors; smaller keys are better
     const Point2D cat = world->getCat();
     const int catIdx = (cat.y + half) * side + cat.x + half;
+    const int seen = playedLike(b, catIdx);
     std::array<std::pair<std::array<int, 5>, int>, 6> moves;
     int moveCount = 0;
     for (int n : b.neigh[catIdx]) {
@@ -253,7 +298,7 @@ namespace {
         cells[count] = moves[count].second;
         count++;
       }
-      int mv = models::modelChoice(b, catIdx, cells, count, Cat::movesThisProcess == 1);
+      int mv = models::modelChoice(b, catIdx, cells, count, Cat::movesThisProcess == 1, seen);
       if (mv >= 0) {
         return {mv % side - half, mv / side - half};
       }
@@ -291,7 +336,7 @@ Point2D Cat::Move(CatWorld* world) {
     anyOpen = anyOpen || (world->isValidPosition(n) && !world->getContent(n));
   }
   if (!anyOpen) {
-    return usual;  // trapped: the catcher already won
+    return remember(side, usual);  // trapped: the catcher already won
   }
   // the survival playouts only once the cat's best two-distance reaches kSurvivalTwo (usualMove left this
   // board's two-distance in b.score): before that, catchers that let the cat out punish anything but running
@@ -304,8 +349,8 @@ Point2D Cat::Move(CatWorld* world) {
     }
   }
   if (bestTwo < kSurvivalTwo || movesThisProcess > 1) {
-    return usual;  // not held yet, or the arena (step 6)
+    return remember(side, usual);  // not held yet, or the arena (step 6)
   }
   const int pick = models::survivalMove(world->worldState(), side, (cat.y + half) * side + cat.x + half, (usual.y + half) * side + usual.x + half);
-  return {pick % side - half, pick / side - half};
+  return remember(side, {pick % side - half, pick / side - half});
 }

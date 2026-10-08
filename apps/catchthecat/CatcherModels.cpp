@@ -20,6 +20,13 @@ namespace {
   constexpr int kEdgeSharePercent = 30;  // general edge models run when this share of blocks is on the border
   constexpr int kPortSignature = 6;      // extra blocks on a student's pattern before trusting their port
   constexpr int kJordanBlocks = 2;       // last blocks the JordanCoolbeth port must explain
+  constexpr int kNearestDepth = 8;       // cat moves searched against kNearestExits (6 and 10 won fewer games)
+  constexpr int kNearestBudget = 60000;  // search nodes per move against it
+  constexpr int kMaxExits = 32;          // nearest exits kNearestExits chooses from
+  constexpr int kPortDepth = 8;
+  constexpr int kPortBudget = 30000;
+  constexpr int kConfirmBlocks = 3;  // last blocks the arena cat's memory needs a model to predict (2 to 5 did as well)
+  constexpr int kPortConfirmBlocks = 6;
 
   // Model search. Each model predicts the catcher's block for a given cat cell; the search looks for a
   // line of cat moves that reaches the border against that prediction.
@@ -31,13 +38,16 @@ namespace {
     kAndrew,           // close port of last year's AndrewGenualdo catcher
     kToag,             // close port of last year's TOAG21 catcher
     kJordan,           // exact port of JordanCoolbeth's catcher (this year's entrant)
+    kNearestExits,     // block one of the border cells nearest the cat, which one unknown (arena cat's memory only)
+    kAylwin,           // exact port of last year's AylwinMorgan catcher (arena cat's memory only)
+    kCosmey,           // exact port of last year's Cosmey catcher (arena cat's memory only)
     kModelCount
   };
 
   struct ModelScratch {
     int side = 0;
     std::vector<int> modelDist, modelQueue;
-    std::vector<int> depthDist[kModelDepth + 1];
+    std::vector<int> depthDist[std::max({kModelDepth, kNearestDepth, kPortDepth}) + 1];
   };
 
   ModelScratch& scratchFor(const grid::Board& b) {
@@ -400,6 +410,268 @@ namespace {
     return bd.blocked(out) || out == cat ? -1 : bd.idx(out);
   }
 
+  // libc++'s std::priority_queue with a greater-than comparator (top: the smallest key), which last year's
+  // AylwinMorgan and Cosmey catchers search with: their ties fall to this heap's order, so the ports copy it.
+  // Node needs a `key`.
+  namespace libcxxHeap {
+    template <class Node> bool below(const Node& a, const Node& b) { return a.key > b.key; }
+
+    // push_heap (__sift_up) for the last of the first len elements
+    template <class Node> void siftUp(std::vector<Node>& heap, int len) {
+      if (len <= 1) {
+        return;
+      }
+      int last = len - 1, parent = (len - 2) / 2;
+      if (!below(heap[parent], heap[last])) {
+        return;
+      }
+      const Node t = heap[last];
+      do {
+        heap[last] = heap[parent];
+        last = parent;
+        if (parent == 0) {
+          break;
+        }
+        parent = (parent - 1) / 2;
+      } while (below(heap[parent], t));
+      heap[last] = t;
+    }
+
+    template <class Node> void push(std::vector<Node>& heap, const Node& n) {
+      heap.push_back(n);
+      siftUp(heap, static_cast<int>(heap.size()));
+    }
+
+    // pop_heap (__floyd_sift_down, then __sift_up) and pop_back
+    template <class Node> Node pop(std::vector<Node>& heap) {
+      const int len = static_cast<int>(heap.size());
+      const Node top = heap[0];
+      if (len > 1) {
+        int hole = 0, child = 0;
+        while (true) {
+          child = 2 * child + 1;
+          if (child + 1 < len && below(heap[child], heap[child + 1])) {
+            child++;
+          }
+          heap[hole] = heap[child];
+          hole = child;
+          if (child > (len - 2) / 2) {
+            break;
+          }
+        }
+        if (hole != len - 1) {
+          heap[hole] = heap[len - 1];
+          siftUp(heap, hole + 1);
+        }
+      }
+      heap.pop_back();
+      return top;
+    }
+  }  // namespace libcxxHeap
+
+  // AylwinMorgan's catcher (last year, AylwinMorgan/mobagen b3caadc, built by the arena from his own World): the
+  // same block on every turn the cat can reach the border (1,009 of 1,009 against his arena bot), with flat
+  // arrays. His A* (step cost 1, heuristic: rings to the border) stops at the first border cell it takes off the
+  // queue, ties in his priority_queue's (libc++'s) heap order (libcxxHeap): first queued or last queued made
+  // only 90% and 80% of his blocks. Then he blocks the exit next to the cat; else the path's cell before the exit
+  // when it is next to a corner, or on a two step path to a left or right edge exit with another open border
+  // cell next to it; else, walking his border list outward from the exit, the first open cell with no blocked
+  // list neighbor. -1 once no border is reachable (he then blocks a random cell next to the cat).
+  namespace aylwin {
+    struct Node {
+      int cell, acc, key;
+    };
+
+    // his border list (clockwise from the top left, without (-h, -h) and (-h, h)) and his index into it, which is
+    // off by one or two from the list's own order; both decide which cell he blocks
+    const std::vector<Pt>& borders(int side) {
+      static std::vector<Pt> list;
+      static int cached = 0;
+      if (cached != side) {
+        cached = side;
+        list.clear();
+        const int h = side / 2;
+        for (int x = -h + 1; x < h; x++) {
+          list.push_back({x, -h});
+        }
+        for (int y = -h; y < h; y++) {
+          list.push_back({h, y});
+        }
+        for (int x = h; x > -h; x--) {
+          list.push_back({x, h});
+        }
+        for (int y = h - 1; y > -h; y--) {
+          list.push_back({-h, y});
+        }
+      }
+      return list;
+    }
+    int borderIndex(Pt p, int side) {
+      const int h = side / 2;
+      if (p.y == -h) {
+        return p.x + h;
+      }
+      if (p.x == h) {
+        return side + p.y + h;
+      }
+      if (p.y == h) {
+        return 3 * side - p.x - h - 1;
+      }
+      return 4 * side - p.y - h - 2;
+    }
+
+    int reply(const grid::Board& b, ModelScratch& s, int catIdx) {
+      const Coords bd{b, b.side / 2};
+      const int h = bd.h;
+      auto& cameFrom = s.modelDist;
+      auto& state = s.modelQueue;  // 0 unseen, 1 queued, 2 done
+      std::fill(cameFrom.begin(), cameFrom.end(), -1);
+      std::fill(state.begin(), state.end(), 0);
+      auto rings = [&](Pt p) { return h - std::max(std::abs(p.x), std::abs(p.y)); };
+      static std::vector<Node> q;
+      q.clear();
+      q.push_back({catIdx, 0, rings(bd.pt(catIdx))});
+      state[catIdx] = 1;
+      int exit = -1;
+      while (!q.empty() && exit < 0) {
+        const Node cur = libcxxHeap::pop(q);
+        state[cur.cell] = 2;
+        const Pt p = bd.pt(cur.cell);
+        const Pt around[6] = {legNE(p), legNW(p), legE(p), legW(p), legSE(p), legSW(p)};  // his neighbors order
+        for (const Pt& n : around) {
+          if (!bd.inside(n)) {
+            exit = cur.cell;  // a border cell: he stops once its neighbors are queued
+            continue;
+          }
+          const int ni = bd.idx(n);
+          if (ni == catIdx || !b.open[ni] || state[ni] != 0) {
+            continue;
+          }
+          cameFrom[ni] = cur.cell;
+          libcxxHeap::push(q, Node{ni, cur.acc + 1, cur.acc + 1 + rings(n)});
+          state[ni] = 1;
+        }
+      }
+      if (exit < 0 || exit == catIdx) {
+        return -1;  // no border reachable: he blocks a random cell next to the cat
+      }
+      if (cameFrom[exit] == catIdx) {
+        return exit;  // the cat is next to its exit
+      }
+      const int prev = cameFrom[exit];  // his catPath[1]
+      const bool twoSteps = cameFrom[prev] == catIdx;
+      const Pt target = bd.pt(exit), before = bd.pt(prev);
+      if (std::abs(before.x) == h - 1 && std::abs(before.y) == h - 1) {
+        return prev;  // the path turns at a corner
+      }
+      const auto& list = borders(b.side);
+      const int count = static_cast<int>(list.size());
+      const int t = borderIndex(target, b.side);
+      auto at = [&](int k) { return list[k % count]; };
+      auto open = [&](Pt c) { return b.open[bd.idx(c)] != 0; };
+      if (twoSteps && std::abs(target.x) == h) {
+        for (int i = -2; i <= 2; i++) {
+          const Pt c = at(t + count + i);
+          if (c != target && open(c)) {
+            const int ci = bd.idx(c);
+            for (int nb : b.neigh[prev]) {
+              if (nb == ci) {
+                return prev;  // a second exit next to the cell before the exit
+              }
+            }
+          }
+        }
+      }
+      // outward from the exit along his list, alternating sides: the first open cell with no blocked list neighbor
+      for (int i = 0; i < count; i++) {
+        const int k = t + count + (i % 2 == 0 ? i / 2 : -(i / 2));
+        if (!open(at(k))) {
+          continue;
+        }
+        const int walls = !open(at(k - 1)) + !open(at(k + 1));
+        if (walls == 0 || (walls < 2 && at(k) == target && twoSteps)) {
+          if (walls > 0) {
+            if (open(at(k - 1))) {
+              return bd.idx(at(k - 1));
+            }
+            if (open(at(k + 1))) {
+              return bd.idx(at(k + 1));
+            }
+          }
+          return bd.idx(at(k));
+        }
+      }
+      return exit;
+    }
+  }  // namespace aylwin
+
+  // Cosmey's catcher (last year, Cosmey/mobagenReeceEnthoven 3443e4a, built by the arena from his own World): his
+  // generatePath is a best-first search from the cat, priority 0.99 * steps - rings from the center (in float,
+  // as his code computes it), that stops at the first cell it takes off the queue with a neighbor off the board;
+  // ties in libc++'s heap order (libcxxHeap). He blocks that exit when it is next to the cat; else the exit of a
+  // second search with the first exit closed off, or the first exit when the second finds none. -1 once no
+  // border is reachable (he then blocks a random cell next to the cat).
+  namespace cosmey {
+    struct Node {
+      int cell;
+      float key;
+      int steps;
+    };
+
+    // his calculateHeuristic
+    float priority(Pt p, int steps) {
+      float scaled = steps * 0.99f;
+      if (steps - scaled >= 1) {
+        scaled = static_cast<float>(steps);
+      }
+      return -static_cast<float>(std::max(std::abs(p.x), std::abs(p.y))) + scaled;
+    }
+
+    // his generatePath's exit (-1 if none), never through `closed`; leaves each cell's parent in s.modelDist
+    int exitOf(const grid::Board& b, ModelScratch& s, int catIdx, int closed) {
+      const Coords bd{b, b.side / 2};
+      auto& cameFrom = s.modelDist;
+      auto& state = s.modelQueue;  // 0 unseen, 1 queued, 2 done (or closed)
+      std::fill(cameFrom.begin(), cameFrom.end(), -1);
+      std::fill(state.begin(), state.end(), 0);
+      if (closed >= 0) {
+        state[closed] = 2;
+      }
+      static std::vector<Node> q;
+      q.clear();
+      q.push_back({catIdx, 0.0f, 0});
+      state[catIdx] = 1;
+      while (!q.empty()) {
+        const Node cur = libcxxHeap::pop(q);
+        state[cur.cell] = 2;
+        const Pt p = bd.pt(cur.cell);
+        const Pt around[6] = {legNE(p), legNW(p), legE(p), legW(p), legSW(p), legSE(p)};  // his neighbors order
+        for (const Pt& n : around) {
+          if (!bd.inside(n)) {
+            return cur.cell;  // a border cell
+          }
+          const int ni = bd.idx(n);
+          if (!b.open[ni] || state[ni] != 0) {
+            continue;
+          }
+          cameFrom[ni] = cur.cell;
+          libcxxHeap::push(q, Node{ni, priority(n, cur.steps + 1), cur.steps + 1});
+          state[ni] = 1;
+        }
+      }
+      return -1;
+    }
+
+    int reply(const grid::Board& b, ModelScratch& s, int catIdx) {
+      const int exit = exitOf(b, s, catIdx, -1);
+      if (exit < 0 || exit == catIdx || s.modelDist[exit] == catIdx) {
+        return exit == catIdx ? -1 : exit;
+      }
+      const int second = exitOf(b, s, catIdx, exit);
+      return second >= 0 ? second : exit;
+    }
+  }  // namespace cosmey
+
   // JordanCoolbeth's catcher (dewdrop-ripple/GPR-340-mobagen e0c007a) while the cat can reach the border:
   // his generatePath finds the first border cell a BFS from the cat reaches (neighbors in his order NE, NW,
   // SE, SW, E, W). Next to the cat, he blocks it; otherwise he walks the border from it, a step clockwise
@@ -469,10 +741,49 @@ namespace {
     return -1;
   }
 
+  // kNearestExits: the open border cells nearest the cat (fewest steps through open cells) into `out`; returns
+  // how many. Last year's edge catchers mostly block one of these, each breaking ties its own way (A* and
+  // priority queues whose order no simple rule reproduces).
+  int nearestExitSet(const grid::Board& b, ModelScratch& s, int cat, int (&out)[kMaxExits]) {
+    auto& d = s.modelDist;
+    auto& q = s.modelQueue;
+    std::fill(d.begin(), d.end(), -1);
+    d[cat] = 0;
+    int tail = 0, found = 0, reach = -1;
+    q[tail++] = cat;
+    for (int head = 0; head < tail; head++) {
+      const int c = q[head];
+      if (reach >= 0 && d[c] >= reach) {
+        break;  // every border cell at that distance is found
+      }
+      for (int m : b.neigh[c]) {
+        if (m < 0 || !b.open[m] || d[m] >= 0) {
+          continue;
+        }
+        d[m] = d[c] + 1;
+        if (b.isBorder[m]) {
+          reach = d[m];
+          if (found < kMaxExits) {
+            out[found++] = m;
+          }
+          continue;
+        }
+        q[tail++] = m;
+      }
+    }
+    return found;
+  }
+
   // the model's block with the cat standing on `cat`, or -1
   int modelReply(const grid::Board& b, ModelScratch& s, int model, int cat) {
     if (model == kJordan) {
       return jordanReply(b, s, cat);
+    }
+    if (model == kAylwin) {
+      return aylwin::reply(b, s, cat);
+    }
+    if (model == kCosmey) {
+      return cosmey::reply(b, s, cat);
     }
     if (model == kAndrew) {
       return andrewReply(b, cat);
@@ -541,8 +852,57 @@ namespace {
     return false;
   }
 
+  // Search against kNearestExits. Demanding a line that beats every choice of exit (as beatsModel would)
+  // finds too few: the real catchers break ties one fixed way, rarely the worst for the cat. So each choice
+  // is taken as equally likely and the cat goes for the best chance.
+
+  double nearestExitOdds(grid::Board& b, ModelScratch& s, int cat, int depth, int& budget);
+
+  // the cat just moved to `cat`: its chance to win within `depth` - 1 more moves if the catcher blocks one of
+  // its nearest exits at random
+  double oddsAfterMove(grid::Board& b, ModelScratch& s, int cat, int depth, int& budget) {
+    int exits[kMaxExits];
+    const int count = nearestExitSet(b, s, cat, exits);
+    if (count == 0) {
+      return 0.0;  // sealed in
+    }
+    double sum = 0.0;
+    for (int k = 0; k < count; k++) {
+      grid::setOpen(b, exits[k], false);
+      if (!trappedAt(b, cat)) {
+        sum += nearestExitOdds(b, s, cat, depth - 1, budget);
+      }
+      grid::setOpen(b, exits[k], true);
+    }
+    return sum / count;
+  }
+
+  // the cat on `cat` to move: its best chance to reach the border within `depth` moves (only cells within
+  // depth - 1 of the border matter, as in beatsModel)
+  double nearestExitOdds(grid::Board& b, ModelScratch& s, int cat, int depth, int& budget) {
+    if (depth <= 0 || --budget < 0) {
+      return 0.0;
+    }
+    auto& d = s.depthDist[depth];
+    grid::bfsDistanceWithin(b, d, depth - 1);
+    double best = 0.0;
+    for (int n : b.neigh[cat]) {
+      if (n < 0 || !b.open[n] || d[n] > depth - 1) {
+        continue;  // too far to arrive in time
+      }
+      if (b.isBorder[n]) {
+        return 1.0;
+      }
+      best = std::max(best, oddsAfterMove(b, s, n, depth, budget));
+      if (best >= 1.0) {
+        break;
+      }
+    }
+    return best;
+  }
+
   // Reading the catcher's style from the board
-  // The cat has no memory, but the catcher's past blocks stay on the board.
+  // On the leaderboard the cat has no memory, but the catcher's past blocks stay on the board.
 
   // share of blocked cells that sit on the border, in percent
   int borderBlockPercent(const grid::Board& b, const ModelScratch& s) {
@@ -648,6 +1008,9 @@ namespace {
     if (model == kJordan) {
       return false;  // jordanFits decides
     }
+    if (model == kNearestExits || model == kAylwin || model == kCosmey) {
+      return false;  // only the arena cat's memory can tell (see predictedBy)
+    }
     if (model == kAndrew) {
       return andrewPatternExcess(b) >= kPortSignature;
     }
@@ -663,13 +1026,16 @@ namespace {
 
 }  // namespace
 
-// Survival against AaronArchambault's catcher (his 2026-10-05 version, a5248df)
+// Survival against AaronArchambault's catcher (his 2026-10-07 version, 2e882a2)
 //
 // aaron::move is his Catcher::Move rewritten to pick exactly his block with less work:
 //  - sealed in (no escape route): every open cell is tried, the one whose block leaves the cat's biggest run
 //    smallest wins, then the fewest exits (first in board order on ties);
 //  - first look: every open cell scored as a block by the cat's best reply (two-distance, BFS distance,
 //    shortest-path count, region size when sealed), stable sorted, board order on ties;
+//  - closing in (new in 2e882a2): when his best block leaves the cat no finite two-distance, the blocks that do
+//    the same, nearest the cat first (steps ignoring blocks; then his order): the first of 5 whose worst case
+//    (as in the lookahead) still leaves the cat none;
 //  - lookahead: the 5 best blocks, the cat's 2 best replies, the best follow-up among cells within 3 steps of
 //    the reply plus the 10 best first-look blocks; the block with the best worst case wins.
 // The shortcuts, each giving exactly his result:
@@ -1352,6 +1718,60 @@ namespace {
       return worst;
     }
 
+    // his closing in (2e882a2), m.ranked holding his best first-look blocks: among the blocks that leave the cat
+    // no finite two-distance, nearest the cat first (steps ignoring blocks, then his first-look order, then board
+    // order), the first of kTopBlocks whose worst case still leaves it none; -1 if none does. Only the nearest
+    // rings get full scores: enough of them for kTopBlocks blocks.
+    int closingIn(Model& m, int cat, int trialCount, int rankedCount) {
+      static std::vector<int> ring;
+      ring.assign(m.cells, -1);
+      ring[cat] = 0;
+      int tail = 0;
+      m.queue[tail++] = cat;
+      for (int head = 0; head < tail; head++) {
+        const int c = m.queue[head];
+        const int* around = m.neigh.data() + c * 6;
+        for (int k = 0; k < 6; k++) {
+          if (around[k] >= 0 && ring[around[k]] < 0) {
+            ring[around[k]] = ring[c] + 1;
+            m.queue[tail++] = around[k];
+          }
+        }
+      }
+      // full scores need this board's passes (the first look left them), so all before any worst case
+      const Score base = scoreFrom(m, cat, m.two.data(), m.dist.data(), m.paths.data(), m.dist[cat] == kUnreachable);
+      static std::vector<Ranked> picks;
+      picks.resize(m.cells);
+      int pickCount = 0;
+      for (int r = 1; pickCount < kTopBlocks && r < 2 * m.side; r++) {
+        const int ringStart = pickCount;
+        for (int i = 0; i < trialCount; i++) {
+          const Trial& t = m.trials[i];
+          if (t.twoDist != kUnreachable || ring[t.cell] != r) {
+            continue;
+          }
+          const Score sc = (m.inTwoMin[t.cell] || m.inDistMin[t.cell]) ? trialScore(m, cat, t, nullptr) : base;
+          int at = pickCount++;  // in board order, a block only goes ahead of those it beats
+          while (at > ringStart && sc.beats(picks[at - 1].score)) {
+            picks[at] = picks[at - 1];
+            at--;
+          }
+          picks[at] = {sc, t.cell};
+        }
+      }
+      // stop a worst case once a reply leaves the cat a finite two-distance
+      const Score stillHeld{kUnreachable, INT_MIN, 0.0, 0};
+      for (int k = 0; k < kTopBlocks && k < pickCount; k++) {
+        m.blocked[picks[k].cell] = 1;
+        const Score worst = worstCase(m, cat, rankedCount, true, stillHeld);
+        m.blocked[picks[k].cell] = 0;
+        if (worst.twoDist >= kUnreachable) {
+          return picks[k].cell;
+        }
+      }
+      return -1;
+    }
+
     // his sealed-in endgame; -2 to fall through as his code does. Blocks outside the cat's region change
     // nothing, so they keep the unblocked run and exits.
     int endgame(Model& m, int cat) {
@@ -1454,6 +1874,12 @@ namespace {
       }
       if (m.ranked[0].score.twoDist == kCaught.twoDist) {
         return m.ranked[0].cell;
+      }
+      if (m.ranked[0].score.twoDist == kUnreachable) {
+        const int close = closingIn(m, cat, trialCount, rankedCount);
+        if (close >= 0) {
+          return close;
+        }
       }
 
       // lookahead
@@ -1649,19 +2075,76 @@ namespace {
 }  // namespace
 
 namespace models {
-  int modelChoice(grid::Board& b, int cat, const int* cells, int count, bool tryJordan) {
+  int predictedBy(grid::Board& b, int cat, int block) {
+    auto& s = scratchFor(b);
+    grid::setOpen(b, block, true);
+    int mask = 0;
+    for (int m = 0; m < kModelCount; m++) {
+      if (m != kNearestExits) {
+        mask |= (modelReply(b, s, m, cat) == block) << m;
+      }
+    }
+    int exits[kMaxExits];
+    const int count = nearestExitSet(b, s, cat, exits);
+    for (int k = 0; k < count; k++) {
+      mask |= (exits[k] == block) << kNearestExits;
+    }
+    grid::setOpen(b, block, false);
+    return mask;
+  }
+
+  int confirmed(const std::vector<int>& hits) {
+    const int n = static_cast<int>(hits.size());
+    int general = n >= kConfirmBlocks ? ~0 : 0, ports = n >= kPortConfirmBlocks ? ~0 : 0;
+    for (int k = std::max(0, n - kConfirmBlocks); k < n; k++) {
+      general &= hits[k];
+    }
+    for (int k = std::max(0, n - kPortConfirmBlocks); k < n; k++) {
+      ports &= hits[k];
+    }
+    const int portBits = 1 << kAylwin | 1 << kCosmey;
+    return (general & ~portBits) | (ports & portBits);
+  }
+
+  int modelChoice(grid::Board& b, int cat, const int* cells, int count, bool tryJordan, int playedLike) {
     auto& s = scratchFor(b);
     bool fits[kModelCount];
     for (int m = 0; m < kModelCount; m++) {
-      fits[m] = modelFitsBoard(b, s, m);
+      fits[m] = playedLike ? (playedLike >> m & 1) : modelFitsBoard(b, s, m);
     }
     // an exact port that explains the last blocks outranks the general styles
-    if (tryJordan && jordanFits(b, s, cat, kJordanBlocks)) {
+    if (!playedLike && tryJordan && jordanFits(b, s, cat, kJordanBlocks)) {
       for (int m = 0; m < kModelCount; m++) {
         fits[m] = m == kJordan;
       }
     }
-    int budget = kModelBudget, best = -1, bestCount = 0;
+    // an exact port (AylwinMorgan's, Cosmey's) explained the last blocks: plan against it alone (some of their
+    // blocks are nearest exits too)
+    for (int port : {kAylwin, kCosmey}) {
+      if (fits[port]) {
+        for (int m = 0; m < kModelCount; m++) {
+          fits[m] = m == port;
+        }
+        break;
+      }
+    }
+    // a catcher that keeps blocking nearest exits: plan against that alone, for the best chance (it covers
+    // the general styles that pick a nearest exit their own way)
+    if (fits[kNearestExits]) {
+      int budget = kNearestBudget, best = -1;
+      double bestOdds = 0.0;
+      for (int i = 0; i < count; i++) {
+        const double odds = oddsAfterMove(b, s, cells[i], kNearestDepth, budget);
+        if (odds > bestOdds) {
+          bestOdds = odds;
+          best = cells[i];
+        }
+      }
+      return best;
+    }
+    const bool portOnly = fits[kAylwin] || fits[kCosmey];
+    const int depth = portOnly ? kPortDepth : kModelDepth;
+    int budget = portOnly ? kPortBudget : kModelBudget, best = -1, bestCount = 0;
     for (int i = 0; i < count; i++) {
       int n = cells[i], beaten = 0;
       for (int model = 0; model < kModelCount; model++) {
@@ -1674,7 +2157,7 @@ namespace models {
         } else {
           blk = -1;
         }
-        beaten += !trappedAt(b, n) && beatsModel(b, s, n, model, kModelDepth - 1, budget);
+        beaten += !trappedAt(b, n) && beatsModel(b, s, n, model, depth - 1, budget);
         if (blk >= 0) {
           grid::setOpen(b, blk, true);
         }
