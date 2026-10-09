@@ -33,7 +33,8 @@
 //     fit a two-distance cat (ranked like AaronArchambault's: two-distance, BFS distance, more shortest
 //     paths, more room) but do fit one of these: a cat that walks its shortest path to the nearest edge (the
 //     generatePath cat), which a catcher that knows its route traps far sooner; else a lookahead cat, which
-//     weighs each step against the catcher's worst wall next.
+//     weighs each step against the catcher's worst wall next. Steps that fit a two-distance cat and a copy of
+//     AaronArchambault's cat, but not the lookahead cat, make the model his cat.
 // Blocking next to the cat (instead of walling the edge) caught last year's cats about 3 times faster.
 //
 // Speed: a block only reruns the pass it can change (two-distance or BFS distance), BFS distance is only
@@ -58,6 +59,7 @@ namespace {
   constexpr int64_t kScoreStep = 8000000;  // one two-distance step in a value (see valueOf)
   constexpr int kHistorySteps = 5;         // cat steps rebuilt to tell which model cat fits
   constexpr int kHistoryBudget = 400;      // positions each model may try while rebuilding them
+  constexpr int kAaronBudget = 100;        // ... AaronArchambault's cat, which fails when it runs out
   constexpr int kHistoryBlocks = 18;       // cells near an earlier cat cell where its next block may have been
 
   // cells within kModelRadius steps of the cat
@@ -83,10 +85,12 @@ namespace {
     std::vector<Escape> rootEscape;
     std::vector<int> rootBestScore;
     std::vector<std::pair<int64_t, int>> rootValues;
-    std::vector<int> parent;                           // the path cat's search
-    std::vector<double> paths;                         // shortest paths to the border from each cell (nodeDist's board)
-    std::vector<int> lookScore, lookDist;              // the lookahead cat: the board's passes before any wall
-    std::vector<uint8_t> lookScoreFrom, lookDistFrom;  // and the cells a step's best values are built from
+    std::vector<int> parent;                             // the path cat's search
+    std::vector<double> paths;                           // shortest paths to the border from each cell (nodeDist's board)
+    std::vector<int> lookScore, lookDist;                // the lookahead cat: the board's passes before any wall
+    std::vector<uint8_t> lookScoreFrom, lookDistFrom;    // and the cells a step's best values are built from
+    std::vector<int> aaronScore, aaronDist, aaronFence;  // AaronArchambault's cat: the board's passes
+    std::vector<double> aaronPaths;
   };
 
   Buffers& buffersFor(int side) {
@@ -99,11 +103,13 @@ namespace {
     for (auto* v : {&b.cand, &b.inScore, &b.inDist, &b.lookScoreFrom, &b.lookDistFrom}) {
       v->assign(total + 1, 0);
     }
-    for (auto* v :
-         {&b.score, &b.dist, &b.trialScore, &b.trialDist, &b.nodeScore, &b.nodeDist, &b.rootBestScore, &b.parent, &b.lookScore, &b.lookDist}) {
+    for (auto* v : {&b.score, &b.dist, &b.trialScore, &b.trialDist, &b.nodeScore, &b.nodeDist, &b.rootBestScore, &b.parent, &b.lookScore, &b.lookDist,
+                    &b.aaronScore, &b.aaronDist, &b.aaronFence}) {
       v->resize(total + 1);
     }
-    b.paths.resize(total + 1);
+    for (auto* v : {&b.paths, &b.aaronPaths}) {
+      v->resize(total + 1);
+    }
     b.rootEscape.resize(total);
     return b;
   }
@@ -607,7 +613,7 @@ namespace {
     return best;
   }
 
-  enum Model { kTwoDistanceCat, kPathCat, kLookaheadCat };
+  enum Model { kTwoDistanceCat, kPathCat, kLookaheadCat, kAaronCat };
 
   // the two-distance cat's move: a border cell if it can reach one, else its best next cell; -1 when it is
   // trapped
@@ -659,6 +665,132 @@ namespace {
       exit = b.parent[exit];
     }
     return exit;
+  }
+
+  // open cells within 2 steps of p (counted once per route through a neighbor), not counting `from`
+  int roomAround(const Buffers& b, int p, int from) {
+    int count = 0;
+    for (int a : b.neigh[p]) {
+      if (!b.open[a] || a == from) {
+        continue;
+      }
+      count++;
+      for (int c : b.neigh[a]) {
+        if (b.open[c] && c != from && c != p) {
+          count++;
+        }
+      }
+    }
+    return count;
+  }
+
+  // shortest paths to the border from each cell, for `dist` (this board's BFS distance); 0 where it is unreachable
+  void countPaths(Buffers& b, const std::vector<int>& dist, std::vector<double>& paths) {
+    std::fill(paths.begin(), paths.end(), 0.0);
+    int tail = 0;
+    for (int i : b.borders) {
+      if (b.open[i]) {
+        paths[i] = 1.0;
+        b.queue[tail++] = i;
+      }
+    }
+    for (int head = 0; head < tail; head++) {
+      const int c = b.queue[head];
+      for (int n : b.neigh[c]) {
+        if (b.open[n] && dist[n] == dist[c] + 1) {
+          if (paths[n] == 0.0) {
+            b.queue[tail++] = n;
+          }
+          paths[n] += paths[c];
+        }
+      }
+    }
+  }
+
+  // AaronArchambault's cat (AaronArchambault/mobagen 0b09856, Cat.cpp), rewritten to make the same moves faster.
+  // His steps are ranked by two-distance, BFS distance, more shortest paths, farther from the blocked border cells
+  // (ignoring other blocks), then more open cells within 2 steps, and he takes the first. When one block could cut
+  // that step off from the border he also looks one block ahead, but that never changed his step (none of about
+  // 29,000 such positions), so the copy leaves it out: it cost more than the rest of the catcher's playouts.
+
+  // his fence: steps from the nearest blocked border cell, ignoring other blocks (kInf when there is none)
+  void aaronFence(Buffers& b) {
+    const int total = b.side * b.side;
+    int* fence = b.aaronFence.data();
+    int tail = 0;
+    for (int i = 0; i < total; i++) {
+      fence[i] = kInf;
+    }
+    fence[total] = 0;  // the sentinel is never stepped into
+    for (int i : b.borders) {
+      if (!b.open[i]) {
+        fence[i] = 0;
+        b.queue[tail++] = i;
+      }
+    }
+    for (int head = 0; head < tail; head++) {
+      const int c = b.queue[head];
+      for (int m : b.neigh[c]) {
+        if (fence[m] == kInf) {
+          fence[m] = fence[c] + 1;
+          b.queue[tail++] = m;
+        }
+      }
+    }
+  }
+
+  // the board's passes his cat ranks its steps by (the same wherever the cat stands)
+  void aaronPasses(Buffers& b) {
+    twoDistance(b, b.aaronScore);
+    bfsDistance(b, b.aaronDist);
+    countPaths(b, b.aaronDist, b.aaronPaths);
+  }
+
+  // his cat's step from `cat`, aaronPasses holding this board's passes; -1 when it has no open neighbor
+  int aaronStep(Buffers& b, int cat) {
+    const int* score = b.aaronScore.data();
+    const int* dist = b.aaronDist.data();
+    const double* paths = b.aaronPaths.data();
+    bool fenceReady = false;
+    int best = -1;
+    for (int n : b.neigh[cat]) {
+      if (!b.open[n]) {
+        continue;
+      }
+      if (best < 0) {
+        best = n;
+        continue;
+      }
+      // ties keep the earlier step in neighbor order, as his stable sort does
+      bool better = false;
+      if (score[n] != score[best]) {
+        better = score[n] < score[best];
+      } else if (dist[n] != dist[best]) {
+        better = dist[n] < dist[best];
+      } else if (paths[n] != paths[best]) {
+        better = paths[n] > paths[best];
+      } else {
+        if (!fenceReady) {
+          aaronFence(b);
+          fenceReady = true;
+        }
+        if (b.aaronFence[n] != b.aaronFence[best]) {
+          better = b.aaronFence[n] > b.aaronFence[best];
+        } else {
+          better = roomAround(b, n, cat) > roomAround(b, best, cat);
+        }
+      }
+      if (better) {
+        best = n;
+      }
+    }
+    return best;
+  }
+
+  // his cat's step from `cat`; -1 when it has no open neighbor
+  int aaronCatMove(Buffers& b, int cat) {
+    aaronPasses(b);
+    return aaronStep(b, cat);
   }
 
   // The lookahead cat: a cat that looks one move ahead (its step, then the catcher's worst wall). An edge
@@ -798,6 +930,9 @@ namespace {
   }
 
   int modelCatMove(Buffers& b, int cat, Model model) {
+    if (model == kAaronCat) {
+      return aaronCatMove(b, cat);
+    }
     if (model == kPathCat) {
       return pathCatMove(b, cat);
     }
@@ -901,47 +1036,15 @@ namespace {
   void historyPasses(Buffers& b) {
     twoDistance(b, b.nodeScore);
     bfsDistance(b, b.nodeDist);
-    std::fill(b.paths.begin(), b.paths.end(), 0.0);
-    int tail = 0;
-    for (int i : b.borders) {
-      if (b.open[i]) {
-        b.paths[i] = 1.0;
-        b.queue[tail++] = i;
-      }
-    }
-    for (int head = 0; head < tail; head++) {
-      const int c = b.queue[head];
-      for (int n : b.neigh[c]) {
-        if (b.open[n] && b.nodeDist[n] == b.nodeDist[c] + 1) {
-          if (b.paths[n] == 0.0) {
-            b.queue[tail++] = n;
-          }
-          b.paths[n] += b.paths[c];
-        }
-      }
-    }
-  }
-
-  // open cells within 2 steps of p (counted once per route through a neighbor), not counting `from`
-  int roomAround(const Buffers& b, int p, int from) {
-    int count = 0;
-    for (int a : b.neigh[p]) {
-      if (!b.open[a] || a == from) {
-        continue;
-      }
-      count++;
-      for (int c : b.neigh[a]) {
-        if (b.open[c] && c != from && c != p) {
-          count++;
-        }
-      }
-    }
-    return count;
+    countPaths(b, b.nodeDist, b.paths);
   }
 
   // does the model cat on `from` step to `to`? (historyPasses must hold this board's passes for the
-  // two-distance cat, ranked here like AaronArchambault's)
+  // two-distance cat, ranked here like AaronArchambault's, and aaronPasses for his cat)
   bool stepsTo(Buffers& b, Model model, int from, int to) {
+    if (model == kAaronCat) {
+      return aaronStep(b, from) == to;
+    }
     if (model == kPathCat) {
       return pathCatMove(b, from) == to;
     }
@@ -984,6 +1087,8 @@ namespace {
     }
     if (model == kTwoDistanceCat) {
       historyPasses(b);
+    } else if (model == kAaronCat) {
+      aaronPasses(b);
     }
     const int total = b.side * b.side;
     int prev[6];
@@ -1017,11 +1122,20 @@ namespace {
   }
 
   // the first model of the two-distance cat, the path cat and the lookahead cat that explains the cat's last
-  // kHistorySteps steps, or the two-distance cat if none does
+  // kHistorySteps steps, or the two-distance cat if none does. A cat the two-distance cat explains is
+  // AaronArchambault's when his cat explains those steps too and the lookahead cat doesn't: his ranking is
+  // nearly the two-distance cat's, and modeling LogiBear's deeper cats as his let them escape.
   Model modelFor(Buffers& b, int cat) {
     for (Model model : {kTwoDistanceCat, kPathCat, kLookaheadCat}) {
       int budget = kHistoryBudget;
       if (explains(b, model, cat, kHistorySteps, budget)) {
+        if (model == kTwoDistanceCat) {
+          int aaronBudget = kAaronBudget, lookBudget = kHistoryBudget;
+          if (explains(b, kAaronCat, cat, kHistorySteps, aaronBudget) && aaronBudget >= 0
+              && !explains(b, kLookaheadCat, cat, kHistorySteps, lookBudget)) {
+            return kAaronCat;
+          }
+        }
         return model;
       }
     }
