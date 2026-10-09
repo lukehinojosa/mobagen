@@ -36,12 +36,13 @@ namespace models {
   int logi1Bit();
 
   // The arena cat's escape search against an exact copy of a catcher (kEscapeAaron: AaronArchambault's; kEscapeLogi3
-  // and kEscapeLogi1: LogiBear's at depth 3 or 1) from `b` with the cat on `cat` to move, until `deadline`: the cell
+  // and kEscapeLogi1: LogiBear's at depth 3 or 1; kEscapeOman: omanchek's) from `b` with the cat on `cat` to move, until `deadline`: the cell
   // to step to (the next step of a line that wins against the copy, or toward the most promising position found), or
   // -1. Keeps its search tree between calls while the catcher's replies are the copy's.
   constexpr int kEscapeAaron = 0;
   constexpr int kEscapeLogi3 = 1;
   constexpr int kEscapeLogi1 = 2;
+  constexpr int kEscapeOman = 3;
   // With `keepTree` false (the leaderboard: a new process every move) the search starts afresh and only returns the
   // first step of a winning line.
   int escapeMove(const grid::Board& b, int cat, int from, std::chrono::steady_clock::time_point deadline, bool keepTree);
@@ -51,6 +52,13 @@ namespace models {
   // port explains the last 3, nor when AaronArchambault's catcher would have made the last block too; false if
   // `deadline` comes first. Leaves the board as it found it.
   bool logiOnBoard(grid::Board& b, int cat, std::chrono::steady_clock::time_point deadline);
+
+  // On the leaderboard: could omanchek's catcher have made the last `blocks` blocks? kOman, or
+  // kOmanOrJordan when the JordanCoolbeth port explains the last 3 too
+  constexpr int kNotOman = 0;
+  constexpr int kOman = 1;
+  constexpr int kOmanOrJordan = 2;
+  int omanOnBoard(grid::Board& b, int cat, int blocks);
 }  // namespace models
 
 #endif  // CATCHER_MODELS_H

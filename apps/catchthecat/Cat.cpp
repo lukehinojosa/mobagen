@@ -50,6 +50,14 @@
 //     he has made 2; not when step 2's copy of JordanCoolbeth's catcher explains his last three, nor when
 //     AaronArchambault's would have made the last one too. Then a fresh search like step 8's (up to 600 ms from the
 //     start of the move) plays the first step of a line that wins against it.
+// 10. On the leaderboard, against omanchek's catcher: it only blocks border cells, and throws once no border is
+//     reachable (the runner then gives the cat the game), so a held cat's game lasts until the border fills whatever
+//     it does. The board shows it when an exact copy of his catcher would have made the last 3 blocks (6 once the cat
+//     is held: AaronArchambault's catcher sometimes makes 3 like his), unless mcacejr's four corner blocks are on the
+//     board (his catcher's blocks near the border often fit too). Then a search like step 9's (40 ms from the
+//     start of the move) plays the first step of a line that escapes the copy; without one, the cat skips the
+//     survival playouts and step 2's model search (unless JordanCoolbeth's copy explains the last 3 blocks too,
+//     as near the border it does: then step 2 plans against Jordan's as before).
 // All buffers are flat arrays reused across calls, so nothing is allocated after the first move.
 
 namespace {
@@ -67,6 +75,11 @@ namespace {
   constexpr int kLogiWindow = 3;       // step 8: LogiBear's catcher must explain all but one of his last this many blocks
   constexpr int kLogiShareTenths = 6;  // and this many tenths of all his blocks
   constexpr int kLeaderEscapeMs = 600;
+  constexpr int kOmanEscapeMs = 40;   // step 10's search time, from the start of the move
+  constexpr int kOmanBlocks = 3;      // last blocks omanchek's copy must explain (step 10)
+  constexpr int kOmanHeldBlocks = 6;  // ... once the cat is held
+
+  int omanchek = models::kNotOman;  // step 10's recognition this move
 
   // the shared board (Grid.h: neighbor table, open cells, distance passes) and the cat's own arrays, each
   // with the sentinel entry at index side * side
@@ -253,16 +266,34 @@ namespace {
     return models::escapeMove(b, cat, from, start + std::chrono::milliseconds(kEscapeMs), true);
   }
 
-  // step 9 (leaderboard): against LogiBear's catcher, the first step of a line that wins against his catcher at depth
-  // 1, or -1. Not once the cat is held: step 6's playouts against AaronArchambault's catcher take over there
-  int leaderboardEscape(Buffers& b, int cat, std::chrono::steady_clock::time_point start) {
+  // the cat's best two-distance from `cat` (b.score); from kSurvivalTwo on the cat is held
+  int bestTwoFrom(const Buffers& b, int cat) {
     int bestTwo = kInf;
     for (int n : b.neigh[cat]) {
       if (n >= 0 && b.open[n]) {
         bestTwo = std::min(bestTwo, b.score[n]);
       }
     }
-    if (bestTwo >= kSurvivalTwo) {
+    return bestTwo;
+  }
+
+  // mcacejr's catcher blocks these four border cells before anything else (on boards wider than 11), then the exit end
+  // of the cat's path, which near the border often fits omanchek's copy: with all four blocked, step 10 leaves it alone
+  bool mcacejrCorners(const Buffers& b) {
+    const int half = b.side / 2;
+    const int corners[4][2] = {{half, half}, {half, -half}, {1 - half, -half}, {1 - half, half}};
+    for (const auto& c : corners) {
+      if (b.open[(c[1] + half) * b.side + c[0] + half]) {
+        return false;
+      }
+    }
+    return half > 5;
+  }
+
+  // step 9 (leaderboard): against LogiBear's catcher, the first step of a line that wins against his catcher at depth
+  // 1, or -1. Not once the cat is held: step 6's playouts against AaronArchambault's catcher take over there
+  int leaderboardEscape(Buffers& b, int cat, std::chrono::steady_clock::time_point start) {
+    if (bestTwoFrom(b, cat) >= kSurvivalTwo) {
       return -1;
     }
     const auto deadline = start + std::chrono::milliseconds(kLeaderEscapeMs);
@@ -300,7 +331,19 @@ namespace {
     if (line >= 0) {
       return {line % side - half, line / side - half};
     }
-    if (Cat::movesThisProcess == 1) {
+    if (Cat::movesThisProcess == 1 && !mcacejrCorners(b)) {
+      // once the cat is held his copy must explain more blocks: AaronArchambault's catcher sometimes makes 3 like his,
+      // and the survival playouts against Aaron's are worth too much to lose
+      omanchek = models::omanOnBoard(b, catIdx, bestTwoFrom(b, catIdx) >= kSurvivalTwo ? kOmanHeldBlocks : kOmanBlocks);
+    } else {
+      omanchek = models::kNotOman;
+    }
+    if (omanchek != models::kNotOman) {
+      const int esc = models::escapeMove(b, catIdx, models::kEscapeOman, start + std::chrono::milliseconds(kOmanEscapeMs), false);
+      if (esc >= 0) {
+        return {esc % side - half, esc / side - half};
+      }
+    } else if (Cat::movesThisProcess == 1) {
       const int lb = leaderboardEscape(b, catIdx, start);
       if (lb >= 0) {
         return {lb % side - half, lb / side - half};
@@ -367,7 +410,7 @@ namespace {
     }
 
     // model search, unless the win is already forced
-    if (!(moves[0].first[0] == 0 && moves[0].first[1] <= 1)) {
+    if (omanchek != models::kOman && !(moves[0].first[0] == 0 && moves[0].first[1] <= 1)) {
       int cells[6];
       int count = 0;
       while (count < moveCount && moves[count].first[0] < 2) {
@@ -418,13 +461,7 @@ Point2D Cat::Move(CatWorld* world) {
   // board's two-distance in b.score): before that, catchers that let the cat out punish anything but running
   auto& b = buffersFor(side);
   const int catIdx = (cat.y + half) * side + cat.x + half;
-  int bestTwo = kInf;
-  for (int n : b.neigh[catIdx]) {
-    if (n >= 0 && b.open[n]) {
-      bestTwo = std::min(bestTwo, b.score[n]);
-    }
-  }
-  if (bestTwo < kSurvivalTwo || movesThisProcess > 1) {
+  if (bestTwoFrom(b, catIdx) < kSurvivalTwo || movesThisProcess > 1 || omanchek != models::kNotOman) {
     return remember(side, usual);  // not held yet, or the arena (step 6)
   }
   const int pick = models::survivalMove(world->worldState(), side, (cat.y + half) * side + cat.x + half, (usual.y + half) * side + usual.x + half);

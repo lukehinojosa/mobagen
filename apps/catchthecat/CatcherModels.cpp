@@ -31,6 +31,10 @@ namespace {
   constexpr int kPortConfirmBlocks = 6;
   constexpr int kLogiFitBlocks = 2;  // last blocks LogiBear's catcher at depth 1 must explain on the leaderboard
 
+  constexpr int kMaxOmanCandidates = 128;  // blocked border cells omanFits asks about per block
+  constexpr int kOmanFitSearches = 2000;   // searches omanFits may run per move, after which it says no (late in a
+                                           // game many partial histories fit: 200 often stopped short of his)
+
   // Model search. Each model predicts the catcher's block for a given cat cell; the search looks for a
   // line of cat moves that reaches the border against that prediction.
 
@@ -50,9 +54,17 @@ namespace {
     kModelCount
   };
 
+  // a queue entry of omanchek's Dijkstra (omanReply)
+  struct OmanEntry {
+    int cost, cell;
+  };
+  bool operator>(const OmanEntry& a, const OmanEntry& c) { return a.cost > c.cost; }
+
   struct ModelScratch {
     int side = 0;
     std::vector<int> modelDist, modelQueue;
+    std::vector<OmanEntry> omanHeap;
+    int omanSearches = 0;  // omanFits' searches left this move
     std::vector<int> depthDist[std::max({kModelDepth, kNearestDepth, kPortDepth}) + 1];
   };
 
@@ -1341,6 +1353,177 @@ namespace {
       }
     }
     return -1;
+  }
+
+  // omanchek's Dijkstra (omanReply), his std::priority_queue written out: push_heap and pop_heap on a vector are
+  // exactly what it does, and the vector is kept between calls
+  struct OmanSearch {
+    const grid::Board& b;
+    int cat, h, catX, catY, rows;
+    std::vector<int>& cost;
+    std::vector<OmanEntry>& heap;
+
+    OmanSearch(const grid::Board& board, ModelScratch& s, int from)
+        : b(board),
+          cat(from),
+          h(board.side / 2),
+          catX(from % board.side - h),
+          catY(from / board.side - h),
+          rows(std::max(0, h - std::abs(catY) - 1)),
+          cost(s.modelDist),
+          heap(s.omanHeap) {
+      std::fill(cost.begin(), cost.end(), kInf);
+      heap.clear();
+      cost[cat] = 0;
+      push(0, cat);
+    }
+
+    void push(int c, int cell) {
+      heap.push_back({c, cell});
+      std::push_heap(heap.begin(), heap.end(), std::greater<OmanEntry>());
+    }
+
+    OmanEntry pop() {
+      std::pop_heap(heap.begin(), heap.end(), std::greater<OmanEntry>());
+      const OmanEntry top = heap.back();
+      heap.pop_back();
+      return top;
+    }
+
+    int stepCost(int c) const {
+      const int dx = std::abs(c % b.side - h - catX), dy = std::abs(c / b.side - h - catY);
+      int blocked = 1;
+      for (int n : b.neigh[c]) {
+        blocked += n < b.total && !b.open[n];
+      }
+      return 1 + (rows + std::max(0, h - std::max(dx, dy)) + 3 * blocked * blocked) * rows;
+    }
+
+    void expand(const OmanEntry& top) {
+      for (int n : b.neigh[top.cell]) {
+        if (n >= b.total || !b.open[n] || n == cat) {
+          continue;
+        }
+        const int next = top.cost + stepCost(n);
+        if (next < cost[n]) {
+          cost[n] = next;
+          push(next, n);
+        }
+      }
+    }
+  };
+
+  // omanchek's catcher (omanchek/mobagen-gpr340 09e406e; the same blocks since 93b6652): a Dijkstra from the cat
+  // where stepping onto a cell costs 1 + (rows + offset + 3 * (its blocked neighbors + 1)^2) * rows. `rows` is the
+  // cat's distance to the top or bottom edge less 1 (his edge distance only looks at rows), `offset` is half the
+  // side less the cell's larger coordinate difference from the cat. He blocks the first border cell the queue pops.
+  // His costs are whole numbers, so ints here compare the same, and the same std::priority_queue fed the same
+  // pushes pops ties in his order. -1 when no border is reachable: his catcher then throws, so the runner gives the
+  // cat the game.
+  int omanReply(const grid::Board& b, ModelScratch& s, int cat) {
+    OmanSearch q(b, s, cat);
+    while (!q.heap.empty()) {
+      const OmanEntry top = q.pop();
+      if (b.isBorder[top.cell]) {
+        return top.cell;
+      }
+      if (top.cost > q.cost[top.cell]) {
+        continue;  // he expands it again, but nothing gets cheaper
+      }
+      q.expand(top);
+    }
+    return -1;
+  }
+
+  // The blocked border cells that could have been his block with the cat on `cat` (the cell reopened), cheapest
+  // first, into `out`; returns how many. Reopening a cell only makes its neighbors cheaper to step on (one fewer
+  // blocked neighbor each, at most 3 * 13 * rows apiece) and a path to it crosses at most its 3 inner ones (none goes
+  // through a border cell), so a cell whose cost through its cheapest neighbor, less that, is more than the cheapest
+  // open border cell's can't be it. None when no border is reachable: his catcher throws there.
+  int omanCandidates(const grid::Board& b, ModelScratch& s, int cat, int* out, int cap) {
+    OmanSearch q(b, s, cat);
+    const int slack = 3 * 3 * 13 * q.rows;
+    int best = kInf, count = 0;
+    int reach[kMaxOmanCandidates];  // cost of reaching out[k] through its cheapest neighbor
+    while (!q.heap.empty()) {
+      const OmanEntry top = q.pop();
+      if (best != kInf && top.cost > best + slack) {
+        break;  // every neighbor of a cell this dear makes a candidate dearer still
+      }
+      if (top.cost > q.cost[top.cell]) {
+        continue;
+      }
+      if (b.isBorder[top.cell]) {
+        best = std::min(best, top.cost);
+        continue;  // he stops here: nothing goes through a border cell
+      }
+      q.expand(top);
+      for (int n : b.neigh[top.cell]) {
+        if (n >= b.total || b.open[n] || !b.isBorder[n]) {
+          continue;
+        }
+        const int c = top.cost + q.stepCost(n);
+        int k = 0;
+        while (k < count && out[k] != n) {
+          k++;
+        }
+        if (k == count) {
+          if (count == cap) {
+            continue;
+          }
+          out[count] = n;
+          reach[count++] = c;
+        } else {
+          reach[k] = std::min(reach[k], c);
+        }
+      }
+    }
+    if (best == kInf) {
+      return 0;  // sealed in: his catcher would have thrown instead of blocking
+    }
+    int kept = 0;
+    for (int k = 0; k < count; k++) {
+      if (reach[k] - slack <= best) {
+        const int cell = out[k], c = reach[k];
+        int at = kept++;
+        for (; at > 0 && reach[at - 1] > c; at--) {
+          out[at] = out[at - 1];
+          reach[at] = reach[at - 1];
+        }
+        out[at] = cell;
+        reach[at] = c;
+      }
+    }
+    return kept;
+  }
+
+  // could omanchek's catcher have made the last `blocks` blocks? As jordanFits (his blocks are border cells too),
+  // asking his copy only about omanCandidates. False once s.omanSearches runs out
+  bool omanFits(grid::Board& b, ModelScratch& s, int cat, int blocks) {
+    if (--s.omanSearches < 0) {
+      return false;
+    }
+    int cands[kMaxOmanCandidates];
+    const int count = omanCandidates(b, s, cat, cands, kMaxOmanCandidates);
+    for (int k = 0; k < count; k++) {
+      const int i = cands[k];
+      grid::setOpen(b, i, true);
+      bool fits = --s.omanSearches >= 0 && omanReply(b, s, cat) == i;
+      if (fits && blocks > 1) {
+        fits = false;
+        for (int p : b.neigh[cat]) {
+          if (p < b.total && b.open[p] && !b.isBorder[p] && omanFits(b, s, p, blocks - 1)) {
+            fits = true;
+            break;
+          }
+        }
+      }
+      grid::setOpen(b, i, false);
+      if (fits) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // kNearestExits: the open border cells nearest the cat (fewest steps through open cells) into `out`; returns
@@ -2762,7 +2945,7 @@ namespace {
     };
 
     struct Tree {
-      int from = -1;  // models::kEscapeAaron, kEscapeLogi3 or kEscapeLogi1
+      int from = -1;  // models::kEscapeAaron, kEscapeLogi3, kEscapeLogi1 or kEscapeOman
       std::vector<Node> nodes;
       int root = -1;
       std::vector<int> line;  // the nodes of a winning line below the root, then winStep
@@ -2772,11 +2955,17 @@ namespace {
     };
     Tree tree;
 
+    void load(const std::vector<uint8_t>& blocked);
+
     int reply(const std::vector<uint8_t>& blocked, int cat) {
       if (tree.from == models::kEscapeAaron) {
         aaron::Model& m = aaron::modelFor(tree.b.side);
         memcpy(m.blocked.data(), blocked.data(), blocked.size());
         return aaron::move(m, cat);
+      }
+      if (tree.from == models::kEscapeOman) {
+        load(blocked);
+        return omanReply(tree.b, scratchFor(tree.b), cat);
       }
       static logi::Board lb;
       lb.setSide(tree.b.side);
@@ -3050,6 +3239,15 @@ namespace models {
 
   int escapeMove(const grid::Board& b, int cat, int from, std::chrono::steady_clock::time_point deadline, bool keepTree) {
     return escape::move(b, cat, from, deadline, keepTree);
+  }
+
+  int omanOnBoard(grid::Board& b, int cat, int blocks) {
+    auto& s = scratchFor(b);
+    s.omanSearches = kOmanFitSearches;
+    if (!omanFits(b, s, cat, blocks)) {
+      return kNotOman;
+    }
+    return jordanFits(b, s, cat, kJordanBlocks) ? kOmanOrJordan : kOman;
   }
 
   bool logiOnBoard(grid::Board& b, int cat, std::chrono::steady_clock::time_point deadline) {
